@@ -1,0 +1,39 @@
+# Example EzSort Configuration
+# Place this file at:
+#   Windows: %APPDATA%/EzSort/config.json
+#   Linux/macOS: ~/.config/ezsort/config.json
+
+{
+  "categories": {
+    "Images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".ico"],
+    "Videos": [".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv"],
+    "Music": [".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"],
+    "Documents": [".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt"],
+    "Spreadsheets": [".xls", ".xlsx", ".csv", ".ods"],
+    "Presentations": [".ppt", ".pptx", ".odp"],
+    "Archives": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"],
+    "Applications": [".exe", ".msi", ".deb", ".rpm", ".apk", ".dmg"],
+    "Code": [".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".rs", ".go", ".php", ".rb", ".html", ".css", ".json", ".xml", ".yaml", ".yml", ".sql", ".sh", ".bat"],
+    "Fonts": [".ttf", ".otf", ".woff", ".woff2", ".eot"],
+    "Ebooks": [".epub", ".mobi", ".azw", ".fb2"],
+    "Torrents": [".torrent"]
+  },
+  "excluded_dirs": [".git", "node_modules", "__pycache__", ".venv", "venv"],
+  "excluded_extensions": [],
+  "duplicate_strategy": "rename",
+  "confirm_before_move": true,
+  "watch_interval": 2,
+  "custom_rules": [
+    {
+      "type": "filename_contains",
+      "pattern": "invoice",
+      "category": "Documents/Invoices"
+    },
+    {
+      "type": "extension",
+      "pattern": ".psd",
+      "category": "Design"
+    }
+  ],
+  "recursive": false
+}

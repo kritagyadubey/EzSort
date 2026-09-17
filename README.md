@@ -12,6 +12,8 @@ It takes a messy folder and sorts every file into neat subfolders based on what 
 ```
 Downloads/
   vacation.jpg
+  gf.png
+  resume.pdf
   tax-return.pdf
   concert.mp4
   playlist.mp3
@@ -29,8 +31,10 @@ Downloads/
 Downloads/
   Images/
     vacation.jpg
+    gf.png
   Documents/
     tax-return.pdf
+    resume.pdf
   Videos/
     concert.mp4
   Music/

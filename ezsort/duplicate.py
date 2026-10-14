@@ -48,22 +48,25 @@ def find_duplicates(
         Dictionary mapping hash -> list of paths with that hash.
         Only includes groups with more than one file.
     """
-    # Group by size first for quick filtering
-    size_groups: dict[int, list[Path]] = {}
-    for f in files:
-        try:
-            size = f.stat().st_size
-            size_groups.setdefault(size, []).append(f)
-        except OSError:
-            continue
+    if quick:
+        # Group by size first for quick filtering (same size is a
+        # prerequisite for being duplicates of each other).
+        size_groups: dict[int, list[Path]] = {}
+        for f in files:
+            try:
+                size = f.stat().st_size
+                size_groups.setdefault(size, []).append(f)
+            except OSError:
+                continue
+        candidates = [group for group in size_groups.values() if len(group) > 1]
+    else:
+        # Slow path: hash everything, even unique sizes.
+        candidates = [[f] for f in files]
 
     duplicates: dict[str, list[Path]] = {}
 
-    for size, group in size_groups.items():
-        if len(group) < 2:
-            continue
-
-        # Hash files in this size group
+    for group in candidates:
+        # Hash files in this group
         hash_groups: dict[str, list[Path]] = {}
         for f in group:
             h = compute_hash(f)

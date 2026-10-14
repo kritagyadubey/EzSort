@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from ezsort import __version__
+
+VERSION_STRING = f"EzSort version {__version__}"
+
 DEFAULT_CATEGORIES: dict[str, list[str]] = {
     "Images": [
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
@@ -67,11 +71,26 @@ DEFAULT_EXCLUDED_DIRS: list[str] = [
     "EzSort",
 ]
 
+# Extensions that indicate a file is still being downloaded/written.
+# Files with these extensions are never touched by watch mode.
+PARTIAL_DOWNLOAD_EXTENSIONS: list[str] = [
+    ".crdownload", ".part", ".partial", ".opdownload",
+    ".download", ".tmp", ".temp", ".!ut", ".bt!x",
+]
+
+# Windows device names that cannot be used as file/folder names.
+WINDOWS_RESERVED_NAMES: set[str] = {
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+}
+
+# Characters that are illegal in file/folder names on Windows.
+ILLEGAL_PATH_CHARS = '<>:"|?*'
+
 BANNER = r"""
 +------------------------------+
 |            EzSort            |
 |   Keep Your Files Sorted     |
 +------------------------------+
 """
-
-VERSION_STRING = "EzSort version 0.1.0"

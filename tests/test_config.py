@@ -1,9 +1,5 @@
 """Tests for configuration management."""
 
-import json
-import pytest
-from pathlib import Path
-from unittest.mock import patch
 from ezsort.config import (
     load_config, save_config, get_default_config,
     get_config_dir, get_categories, get_excluded_dirs,

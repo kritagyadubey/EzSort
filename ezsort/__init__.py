@@ -1,10 +1,12 @@
 """EzSort - Keep Your Files Sorted, Effortlessly.
 
-A safe, lightweight Python CLI that automatically organizes messy folders
-into categories based on file types.
+A safe, lightweight file organizer with a cross-platform CLI and a
+polished Windows-friendly desktop app. Both interfaces share the same
+sorting engine.
 
 Created by Kritagya Dubey
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Kritagya Dubey"
+__license__ = "MIT"

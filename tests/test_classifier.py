@@ -1,8 +1,7 @@
 """Tests for the file classifier module."""
 
 import pytest
-from pathlib import Path
-from ezsort.classifier import classify_file, classify_batch, _match_custom_rule
+from ezsort.classifier import classify_file, classify_batch
 from ezsort.models import FileItem
 from ezsort.config import get_default_config
 

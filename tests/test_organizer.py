@@ -1,7 +1,6 @@
 """Tests for the organizer module."""
 
 import pytest
-from pathlib import Path
 from ezsort.organizer import execute_operations, execute_single
 from ezsort.models import Operation
 

@@ -4,18 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ezsort"
-version = "0.1.0"
-description = "A safe, lightweight Python CLI that automatically organizes messy folders into categories."
+version = "0.2.0"
+description = "A safe, lightweight file organizer with a CLI and a premium desktop GUI that tidies folders into categories."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
     {name = "Kritagya Dubey"},
 ]
-keywords = ["file-organizer", "cli", "cleanup", "downloads", "organization"]
+keywords = ["file-organizer", "cli", "gui", "desktop", "cleanup", "downloads", "organization"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -32,10 +34,13 @@ dependencies = []
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pyinstaller>=6.0",
+    "pillow>=10.0",
 ]
 
 [project.scripts]
 ezsort = "ezsort.cli:main"
+ezsort-gui = "ezsort.gui:run"
 
 [project.urls]
 Homepage = "https://github.com/kritagyadubey/EzSort"

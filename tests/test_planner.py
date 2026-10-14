@@ -1,7 +1,6 @@
 """Tests for the planner module."""
 
 import pytest
-from pathlib import Path
 from ezsort.planner import create_plan
 from ezsort.models import FileItem, Operation
 

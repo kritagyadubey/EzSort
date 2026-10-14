@@ -1,0 +1,2 @@
+# EzSort has no runtime dependencies — the standard library is enough.
+# Install the package itself with:  pip install .

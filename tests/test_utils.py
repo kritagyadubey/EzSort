@@ -1,6 +1,5 @@
 """Tests for utility functions."""
 
-import pytest
 from pathlib import Path
 from ezsort.utils import get_unique_destination, format_size, is_within_directory
 

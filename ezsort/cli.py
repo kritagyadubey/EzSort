@@ -5,21 +5,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Sequence
 
 from ezsort import __version__
-from ezsort.constants import BANNER, CATEGORY_ORDER, VERSION_STRING
-from ezsort.scanner import scan_directory
-from ezsort.classifier import classify_batch
-from ezsort.planner import create_plan
-from ezsort.organizer import execute_operations
-from ezsort.history import record_operations, undo_last, get_history, clear_history
-from ezsort.duplicate import find_duplicates
+from ezsort import engine
 from ezsort.config import load_config
-from ezsort.utils import green, red, yellow, cyan, bold
-
+from ezsort.constants import BANNER, CATEGORY_ORDER, VERSION_STRING
+from ezsort.utils import bold, get_unique_destination, green, red, yellow
 
 ABOUT_TEXT = f"""
   {bold('EzSort')} v{__version__}
@@ -31,8 +24,35 @@ ABOUT_TEXT = f"""
 """
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Main CLI entry point."""
+# ---------------------------------------------------------------------------
+# Output helpers (honour --quiet)
+# ---------------------------------------------------------------------------
+
+_QUIET = False
+
+
+def say(message: str = "") -> None:
+    """Print normal output (suppressed by --quiet)."""
+    if not _QUIET:
+        print(message)
+
+
+def warn(message: str) -> None:
+    """Print a warning (suppressed by --quiet)."""
+    if not _QUIET:
+        print(yellow(message))
+
+
+def err(message: str) -> None:
+    """Print an error (always shown)."""
+    print(red(message))
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing / dispatch
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ezsort",
         description=(
@@ -48,6 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "  ezsort scan ~/Downloads                  Check folder stats\n"
             "  ezsort undo                              Reverse last sort\n"
             "  ezsort watch ~/Downloads                 Auto-sort new files\n"
+            "  ezsort gui                               Open the desktop app\n"
         ),
     )
     parser.add_argument("--version", action="version", version=VERSION_STRING)
@@ -66,7 +87,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     org_parser.add_argument("folder", help="Path to the folder to organize")
     org_parser.add_argument("--dry-run", action="store_true", help="Preview changes without touching files")
     org_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
-    org_parser.add_argument("--recursive", "-r", action="store_true", help="Include subdirectories")
+    org_parser.add_argument(
+        "--recursive", "-r", action="store_true", default=None,
+        help="Include subdirectories (overrides the config default)",
+    )
+    org_parser.add_argument(
+        "--include-hidden", action="store_true", default=None,
+        help="Also sort hidden files (off by default)",
+    )
+    org_parser.add_argument(
+        "--no-history", action="store_true",
+        help="Do not record this run in undo history",
+    )
 
     # scan command
     scan_parser = subparsers.add_parser(
@@ -75,7 +107,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Scan a folder and show a breakdown of file types, duplicates, and what could be organized.",
     )
     scan_parser.add_argument("folder", help="Path to scan")
-    scan_parser.add_argument("--recursive", "-r", action="store_true", help="Scan subdirectories too")
+    scan_parser.add_argument(
+        "--recursive", "-r", action="store_true", default=None,
+        help="Scan subdirectories too (overrides the config default)",
+    )
+    scan_parser.add_argument(
+        "--no-duplicates", action="store_true",
+        help="Skip the (slower) duplicate content check",
+    )
 
     # watch command
     watch_parser = subparsers.add_parser(
@@ -84,13 +123,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Monitor a folder and automatically organize new files that show up.",
     )
     watch_parser.add_argument("folder", help="Path to watch")
-    watch_parser.add_argument("--interval", type=int, default=2, help="Seconds between scans (default: 2)")
+    watch_parser.add_argument("--interval", type=int, default=None,
+                              help="Seconds between scans (default: from config, usually 2)")
+    watch_parser.add_argument("--recursive", "-r", action="store_true",
+                              help="Also watch subdirectories")
 
     # undo command
-    subparsers.add_parser(
+    undo_parser = subparsers.add_parser(
         "undo",
         help="Reverse the last sort operation",
         description="Undo the most recent organization and put every file back where it was.",
+    )
+    undo_parser.add_argument(
+        "--batch", "-b", metavar="ID",
+        help="Undo a specific batch (see 'ezsort history')",
     )
 
     # history command
@@ -116,6 +162,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Show the active configuration: categories, rules, excluded dirs, and preferences.",
     )
 
+    # gui command
+    subparsers.add_parser(
+        "gui",
+        help="Launch the EzSort desktop app",
+        description="Open the graphical interface (same engine, friendlier controls).",
+    )
+
     # version command
     subparsers.add_parser(
         "version",
@@ -123,7 +176,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Print the current EzSort version.",
     )
 
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Main CLI entry point."""
+    parser = _build_parser()
     args = parser.parse_args(argv)
+
+    global _QUIET
+    _QUIET = bool(getattr(args, "quiet", False))
 
     # Handle --about flag
     if args.about:
@@ -134,13 +196,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     log_level = logging.WARNING
     if args.verbose:
         log_level = logging.DEBUG
-    elif not hasattr(args, "quiet") or not getattr(args, "quiet", False):
+    elif not _QUIET:
         log_level = logging.INFO
 
     logging.basicConfig(
         level=log_level,
         format="[%(levelname)s] %(message)s",
         stream=sys.stderr,
+        force=True,
     )
 
     if not args.command:
@@ -157,13 +220,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "watch":
             return cmd_watch(args)
         elif args.command == "undo":
-            return cmd_undo()
+            return cmd_undo(args)
         elif args.command == "history":
             return cmd_history(args)
         elif args.command == "stats":
             return cmd_stats()
         elif args.command == "config":
             return cmd_config()
+        elif args.command == "gui":
+            return cmd_gui()
         elif args.command == "version":
             print(VERSION_STRING)
             return 0
@@ -173,73 +238,90 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n  Operation cancelled.")
         return 130
+    except BrokenPipeError:  # pragma: no cover - e.g. piping into head
+        return 0
     except Exception as e:
-        logging.error("Unexpected error: %s", e)
+        logging.error("Unexpected error: %s", e, exc_info=args.verbose)
+        err(f"  Unexpected error: {e}")
         return 1
 
+
+def _resolve_folder(raw: str) -> Path | None:
+    target = Path(raw).expanduser()
+    try:
+        target = target.resolve()
+    except OSError:
+        pass
+    if not target.exists():
+        err(f"  Error: Folder not found: {target}")
+        return None
+    if not target.is_dir():
+        err(f"  Error: Not a directory: {target}")
+        return None
+    return target
+
+
+def _recursive_choice(flag: bool | None, config: dict) -> bool:
+    """CLI flag wins; otherwise fall back to the configured default."""
+    if flag is None:
+        return bool(config.get("recursive", False))
+    return bool(flag)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 def cmd_organize(args: argparse.Namespace) -> int:
     """Handle the organize command."""
-    target = Path(args.folder).expanduser().resolve()
-
-    if not target.exists():
-        print(red(f"  Error: Folder not found: {target}"))
-        return 1
-    if not target.is_dir():
-        print(red(f"  Error: Not a directory: {target}"))
+    target = _resolve_folder(args.folder)
+    if target is None:
         return 1
 
     config = load_config()
+    if args.include_hidden:
+        config = dict(config)
+        config["skip_hidden"] = False
+    recursive = _recursive_choice(args.recursive, config)
 
-    print(f"\n  Scanning {target} ...")
-    files = scan_directory(target, recursive=args.recursive)
+    say(f"\n  Scanning {target} ...")
+    preview = engine.build_preview(target, config=config, recursive=recursive)
 
-    if not files:
-        print(yellow("  Nothing to sort here. Folder is clean!"))
+    for error in preview.errors:
+        warn(f"  Warning: {error}")
+
+    if not preview.files:
+        say(yellow("  Nothing to sort here. Folder is clean!"))
         return 0
 
-    print(f"  Found {len(files)} file(s).")
+    say(f"  Found {len(preview.files)} file(s).")
+    if preview.skipped:
+        say(f"  Skipped {len(preview.skipped)} file(s) (hidden, excluded, or already sorted).")
 
-    # Classify
-    classified = classify_batch(files, config)
-
-    # Plan
-    plan = create_plan(classified, target)
-
-    if not plan:
-        print(yellow("  Everything is already in its place. Nice!"))
+    if not preview.operations:
+        say(yellow("  Everything is already in its place. Nice!"))
         return 0
 
     # Dry run
     if args.dry_run:
         print(f"\n  {bold('DRY RUN')} -- nothing gets moved\n")
-        print(f"  {'File':<30} {'->':<5} {'Destination'}")
-        print(f"  {'-'*30} {'-'*5} {'-'*30}")
-        for op in plan:
-            try:
-                rel_source = op.source.relative_to(target)
-            except ValueError:
-                rel_source = op.source.name
-            try:
-                rel_dest = op.destination.relative_to(target)
-            except ValueError:
-                rel_dest = op.destination
-            print(f"  {str(rel_source):<30} {'->':<5} {rel_dest}")
-        print(f"\n  {len(plan)} file(s) would be moved.")
-        print(f"  Run without --dry-run to apply.\n")
+        _print_plan(target, preview.operations)
+        print(f"\n  {len(preview.operations)} file(s) would be moved.")
+        print("  Run without --dry-run to apply.\n")
         return 0
 
     # Confirmation
     if not args.yes and config.get("confirm_before_move", True):
-        print(f"\n  About to move {len(plan)} file(s):")
-        for op in plan[:10]:
+        print(f"\n  About to move {len(preview.operations)} file(s):")
+        for op in preview.operations[:10]:
             try:
                 rel_dest = op.destination.relative_to(target)
             except ValueError:
                 rel_dest = op.destination
-            print(f"    {op.source.name} -> {rel_dest}")
-        if len(plan) > 10:
-            print(f"    ... and {len(plan) - 10} more")
+            marker = " (renamed: name in use)" if op.collision else ""
+            print(f"    {op.source.name} -> {rel_dest}{marker}")
+        if len(preview.operations) > 10:
+            print(f"    ... and {len(preview.operations) - 10} more")
         print()
         answer = input("  Proceed? [y/N]: ").strip().lower()
         if answer not in ("y", "yes"):
@@ -247,76 +329,113 @@ def cmd_organize(args: argparse.Namespace) -> int:
             return 0
 
     # Execute
-    print(f"\n  Sorting {len(plan)} file(s) ...")
-    start_time = time.time()
-    results = execute_operations(plan, dry_run=False)
-    elapsed = time.time() - start_time
-
-    # Record history
-    batch_id = record_operations(results)
+    print(f"\n  Sorting {len(preview.operations)} file(s) ...")
+    summary = engine.run_plan(
+        preview,
+        dry_run=False,
+        record=not args.no_history,
+        config=config,
+    )
 
     # Summary
-    moved = sum(1 for r in results if r.success)
-    failed = sum(1 for r in results if not r.success)
+    print(f"\n  {green('Done!')} {summary.moved} file(s) sorted in {summary.elapsed:.2f}s")
+    if summary.skipped_duplicates:
+        print(
+            f"  {len(summary.skipped_duplicates)} duplicate-name move(s) skipped "
+            f"(duplicate_strategy = skip)."
+        )
+    if summary.failed:
+        err(f"  {summary.failed} file(s) failed to move:")
+        for result in summary.failures[:10]:
+            print(f"    - {result.error}")
+        if summary.failed > 10:
+            print(f"    ... and {summary.failed - 10} more")
+    if summary.batch_id:
+        print(f"  Batch ID: {summary.batch_id}")
+        print("  Undo anytime with: ezsort undo\n")
+    elif args.no_history:
+        say("  (history recording disabled for this run)")
 
-    print(f"\n  {green('Done!')} {moved} file(s) sorted in {elapsed:.2f}s")
-    if failed:
-        print(f"  {red(f'{failed} file(s) failed to move.')}")
-    print(f"  Batch ID: {batch_id}")
-    print(f"  Undo anytime with: ezsort undo\n")
+    return 0 if summary.failed == 0 else 1
 
-    return 0 if failed == 0 else 1
+
+def _print_plan(target: Path, operations, limit: int = 200) -> None:
+    print(f"  {'File':<30} {'->':<5} {'Destination'}")
+    print(f"  {'-'*30} {'-'*5} {'-'*30}")
+    for op in operations[:limit]:
+        try:
+            rel_source = op.source.relative_to(target)
+        except ValueError:
+            rel_source = op.source.name
+        try:
+            rel_dest = op.destination.relative_to(target)
+        except ValueError:
+            rel_dest = op.destination
+        marker = ""
+        if op.collision:
+            try:
+                final = get_unique_destination(op.destination)
+                marker = f"   [renamed -> {final.name}]"
+            except RuntimeError:
+                marker = "   [rename pending]"
+        print(f"  {str(rel_source):<30} {'->':<5} {rel_dest}{marker}")
+    if len(operations) > limit:
+        print(f"  ... and {len(operations) - limit} more")
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
     """Handle the scan command."""
-    target = Path(args.folder).expanduser().resolve()
-
-    if not target.exists():
-        print(red(f"  Error: Folder not found: {target}"))
-        return 1
-    if not target.is_dir():
-        print(red(f"  Error: Not a directory: {target}"))
+    target = _resolve_folder(args.folder)
+    if target is None:
         return 1
 
     config = load_config()
-    files = scan_directory(target, recursive=args.recursive)
+    recursive = _recursive_choice(args.recursive, config)
 
-    if not files:
-        print(yellow("  Folder is empty. Nothing to scan."))
-        return 0
+    preview = engine.build_preview(
+        target,
+        config=config,
+        recursive=recursive,
+        count_duplicates=not args.no_duplicates,
+    )
 
-    # Classify for category counts
-    classified = classify_batch(files, config)
-    category_counts: dict[str, int] = {}
-    for _, category, _ in classified:
-        top = category.split("/")[0]
-        category_counts[top] = category_counts.get(top, 0) + 1
+    # Directory count (top level, tolerant of unreadable entries)
+    dir_count = 0
+    try:
+        for entry in target.iterdir():
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    dir_count += 1
+            except OSError:
+                continue
+    except OSError as e:
+        warn(f"  Warning: Cannot list {target}: {e}")
 
-    # Duplicate check
-    file_paths = [f.path for f in files if f.path.is_file()]
-    duplicates = find_duplicates(file_paths)
-    duplicate_count = sum(len(paths) - 1 for paths in duplicates.values())
-
-    # Count organizable
-    plan = create_plan(classified, target)
-    organizable = len(plan)
+    if not preview.files and not preview.operations:
+        say(yellow("  Folder is empty. Nothing to scan."))
+        for error in preview.errors:
+            warn(f"  Warning: {error}")
+        return 1 if preview.errors else 0
 
     print(f"\n  {bold('Scan Report')}")
     print(f"  {'='*30}")
-    print(f"  Files found:        {len(files)}")
-    print(f"  Directories:        {sum(1 for f in target.iterdir() if f.is_dir())}")
+    print(f"  Files found:        {len(preview.files)}")
+    print(f"  Directories:        {dir_count}")
+    if preview.total_size:
+        from ezsort.utils import format_size
+        print(f"  Total size:         {format_size(preview.total_size)}")
     print()
     for cat in CATEGORY_ORDER:
-        count = category_counts.get(cat, 0)
+        count = preview.categories.get(cat, 0)
         if count > 0:
             print(f"  {cat + ':':<20} {count}")
-    others = category_counts.get("Others", 0)
-    if others:
-        print(f"  {'Others:':<20} {others}")
     print()
-    print(f"  Potential duplicates: {duplicate_count}")
-    print(f"  Organizable files:    {organizable}")
+    print(f"  Potential duplicates: {preview.duplicates}")
+    print(f"  Organizable files:    {len(preview.operations)}")
+    if preview.skipped:
+        print(f"  Skipped files:        {len(preview.skipped)}")
+    for error in preview.errors:
+        warn(f"  Warning: {error}")
     print()
 
     return 0
@@ -326,38 +445,46 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """Handle the watch command."""
     from ezsort.watcher import watch_directory
 
-    target = Path(args.folder).expanduser().resolve()
-
-    if not target.exists():
-        print(red(f"  Error: Folder not found: {target}"))
-        return 1
-    if not target.is_dir():
-        print(red(f"  Error: Not a directory: {target}"))
+    target = _resolve_folder(args.folder)
+    if target is None:
         return 1
 
     config = load_config()
-    watch_directory(target, interval=args.interval, config=config)
+    interval = args.interval if args.interval is not None else int(config.get("watch_interval", 2))
+    if interval < 1:
+        err("  Error: --interval must be at least 1 second.")
+        return 1
+
+    watch_directory(
+        target,
+        interval=interval,
+        recursive=bool(args.recursive),
+        config=config,
+    )
     return 0
 
 
-def cmd_undo() -> int:
+def cmd_undo(args: argparse.Namespace) -> int:
     """Handle the undo command."""
-    success, message = undo_last()
+    if getattr(args, "batch", None):
+        success, message = engine.undo_specific_batch(args.batch)
+    else:
+        success, message = engine.undo_last_batch()
     if success:
         print(green(f"  {message}"))
     else:
-        print(red(f"  {message}"))
+        err(f"  {message}")
     return 0 if success else 1
 
 
 def cmd_history(args: argparse.Namespace) -> int:
     """Handle the history command."""
     if args.clear:
-        clear_history()
+        engine.wipe_history()
         print(green("  History cleared."))
         return 0
 
-    history = get_history()
+    history = engine.load_history()
 
     if not history:
         print(yellow("  No history yet. Run 'ezsort organize' first."))
@@ -366,42 +493,46 @@ def cmd_history(args: argparse.Namespace) -> int:
     if args.details:
         for batch in history:
             print(f"\n  Batch {batch['batch_id']} - {batch['timestamp']}")
-            print(f"  Moved: {batch['total_moved']} file(s)")
+            print(f"  Moved: {batch.get('total_moved', 0)} file(s)"
+                  + (f", Failed: {batch['total_failed']}"
+                     if batch.get("total_failed") else ""))
             for op in batch.get("operations", []):
-                print(f"    {Path(op['source']).name} -> {op['category']}/")
+                status = "" if op.get("status", "moved") == "moved" else "  [FAILED]"
+                line = f"    {Path(op['source']).name} -> {op['category']}/{status}"
+                if op.get("error"):
+                    line += f" ({op['error']})"
+                print(line)
     else:
         print(f"\n  {'ID':<6} {'Date':<25} {'Action'}")
         print(f"  {'-'*6} {'-'*25} {'-'*30}")
         for batch in history:
-            ts = batch["timestamp"][:19].replace("T", " ")
-            print(f"  {batch['batch_id']:<6} {ts:<25} Organized {batch['total_moved']} file(s)")
+            ts = str(batch.get("timestamp", ""))[:19].replace("T", " ")
+            action = f"Organized {batch.get('total_moved', 0)} file(s)"
+            failed = batch.get("total_failed", 0)
+            if failed:
+                action += f", {failed} failed"
+            print(f"  {batch['batch_id']:<6} {ts:<25} {action}")
     print()
     return 0
 
 
 def cmd_stats() -> int:
     """Handle the stats command."""
-    history = get_history()
+    stats = engine.stats()
 
-    if not history:
+    if not stats["batches"]:
         print(yellow("  No stats yet. Run 'ezsort organize' first."))
         return 0
 
-    total = 0
-    category_totals: dict[str, int] = {}
-
-    for batch in history:
-        total += batch.get("total_moved", 0)
-        for op in batch.get("operations", []):
-            cat = op.get("category", "Others").split("/")[0]
-            category_totals[cat] = category_totals.get(cat, 0) + 1
-
     print(f"\n  {bold('Your Sorting Stats')}")
     print(f"  {'='*30}")
-    print(f"  Total files organized: {total:,}")
+    print(f"  Total files organized: {stats['total_moved']:,}")
+    if stats["total_failed"]:
+        print(f"  Failed operations:     {stats['total_failed']:,}")
+    print(f"  Sort operations:        {stats['batches']:,}")
     print()
     for cat in CATEGORY_ORDER:
-        count = category_totals.get(cat, 0)
+        count = stats["categories"].get(cat, 0)
         if count > 0:
             print(f"  {cat + ':':<20} {count:,}")
     print()
@@ -410,19 +541,39 @@ def cmd_stats() -> int:
 
 def cmd_config() -> int:
     """Handle the config command."""
+    from ezsort.config import get_config_path
+
     config = load_config()
 
     print(f"\n  {bold('Configuration')}")
     print(f"  {'='*30}")
-    print(f"  Categories:")
+    print(f"  File: {get_config_path()}")
+    print("  Categories:")
     for cat, exts in config.get("categories", {}).items():
         print(f"    {cat}: {len(exts)} extensions")
     print(f"\n  Custom rules: {len(config.get('custom_rules', []))}")
     print(f"  Excluded dirs: {config.get('excluded_dirs', [])}")
+    print(f"  Excluded extensions: {config.get('excluded_extensions', [])}")
     print(f"  Confirm before move: {config.get('confirm_before_move', True)}")
+    print(f"  Recursive by default: {config.get('recursive', False)}")
+    print(f"  Skip hidden files: {config.get('skip_hidden', True)}")
+    print(f"  Skip partial downloads: {config.get('skip_partial_downloads', True)}")
     print(f"  Duplicate strategy: {config.get('duplicate_strategy', 'rename')}")
+    print(f"  Watch interval: {config.get('watch_interval', 2)}s")
+    print(f"  Theme: {config.get('theme', 'dark')}")
     print()
     return 0
+
+
+def cmd_gui() -> int:
+    """Launch the desktop application."""
+    try:
+        from ezsort.gui import run as run_gui
+    except ImportError as e:
+        err(f"  Error: The desktop interface needs tkinter ({e}).")
+        err("  On Debian/Ubuntu install it with: sudo apt install python3-tk")
+        return 1
+    return run_gui()
 
 
 if __name__ == "__main__":

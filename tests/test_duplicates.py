@@ -1,7 +1,5 @@
 """Tests for duplicate detection."""
 
-import pytest
-from pathlib import Path
 from ezsort.duplicate import compute_hash, find_duplicates, get_duplicate_report
 
 

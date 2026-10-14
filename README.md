@@ -1,6 +1,6 @@
 # EzSort
 
-> Your downloads folder is a disaster. EzSort fixes that in one command.
+> Your downloads folder is a disaster. EzSort fixes that — from the command line or a polished desktop app.
 
 ---
 
@@ -56,6 +56,45 @@ No files deleted. No files overwritten. Just organized.
 
 ---
 
+## Desktop App (v0.2.0)
+
+EzSort now ships with a premium dark-theme desktop app — same engine,
+same safety guarantees, zero extra runtime dependencies (it uses the
+Tkinter that already comes with Python).
+
+![Organizer preview](docs/screenshots/organizer-preview.png)
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+![Settings](docs/screenshots/settings.png)
+
+![History](docs/screenshots/history.png)
+
+**Features**
+
+- **Dashboard** — pick a folder, see live stats, jump straight into a preview
+- **Organizer** — preview every planned move in a table, then execute with one click; cancellable mid-sort
+- **Categories** — browse built-in categories and add/edit/delete custom rules
+- **History** — list past sorts, inspect the files in each, and undo any batch (conflict-safe)
+- **Activity** — live event log of everything EzSort has done
+- **Settings** — dark/light theme, duplicate strategy, watch interval, and more; changes save instantly
+
+Every button does real work — previews are the same plan the CLI would execute.
+
+**Launch it**
+
+```bash
+ezsort gui              # from the CLI
+ezsort-gui              # dedicated launcher
+python -m ezsort.gui    # as a module
+```
+
+Or download the standalone Windows `EzSort.exe` from
+[Releases](https://github.com/kritagyadubey/EzSort/releases) — no Python
+required.
+
+---
+
 ## Install
 
 ```bash
@@ -63,6 +102,9 @@ pip install ezsort
 ```
 
 That's it. Zero dependencies. Works on Windows, macOS, and Linux.
+
+Windows users can also grab the standalone executables (GUI + CLI) from
+the [Releases page](https://github.com/kritagyadubey/EzSort/releases).
 
 ---
 
@@ -74,6 +116,9 @@ ezsort organize ~/Downloads --dry-run
 
 # Actually sort the folder
 ezsort organize ~/Downloads --yes
+
+# Open the desktop app
+ezsort gui
 
 # Scan a folder to see what's in it
 ezsort scan ~/Downloads
@@ -111,13 +156,25 @@ ezsort watch ~/Downloads
 
 Keeps a folder sorted automatically. New files get moved as they appear. Press `Ctrl+C` to stop.
 
+### `gui` -- Open the desktop app
+
+```bash
+ezsort gui
+```
+
+Launches the EzSort desktop app with a premium dark theme. Same engine,
+same preview-first safety.
+
 ### `undo` -- Take it back
 
 ```bash
-ezsort undo
+ezsort undo                # undo the most recent sort
+ezsort undo --batch 003    # undo a specific batch (see 'ezsort history')
 ```
 
-Reverses the last sort operation. Every file goes back to where it was.
+Reverses a sort operation. Every file goes back to where it was. If an
+original location is now occupied by a different file, EzSort skips it
+(never overwrites) and keeps it in history so you can resolve it later.
 
 ### `history` -- See what happened
 
@@ -254,7 +311,10 @@ EzSort recognizes **140+ file extensions** across 12 categories:
 - Windows 10/11
 - macOS 10.15+
 - Linux (Ubuntu, Fedora, Debian, Arch, etc.)
-- Requires Python 3.8+
+- Requires Python 3.9+
+
+> **Tip:** set the `EZSORT_HOME` environment variable to relocate EzSort's
+> config and data directory (handy for portable installs or tests).
 
 ---
 
@@ -298,6 +358,17 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -e ".[dev]"
 pytest
 ```
+
+**Building the Windows executables**
+
+```bash
+python scripts/make_icon.py                              # regenerate the icon
+pyinstaller packaging/ezsort-gui.spec --noconfirm         # -> dist/EzSort/EzSort.exe
+pyinstaller packaging/ezsort-cli.spec --noconfirm         # -> dist/ezsort-cli/ezsort.exe
+```
+
+CI builds both automatically on every push to `main`, and attaches them
+to a GitHub Release whenever a `v*` tag is pushed.
 
 ---
 

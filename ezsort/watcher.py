@@ -3,105 +3,252 @@
 from __future__ import annotations
 
 import logging
-import time
+import threading
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Optional
 
-from ezsort.scanner import scan_directory
 from ezsort.classifier import classify_file
-from ezsort.planner import create_plan
-from ezsort.organizer import execute_operations
+from ezsort.config import get_excluded_dirs, get_excluded_extensions
+from ezsort.constants import PARTIAL_DOWNLOAD_EXTENSIONS
+from ezsort.history import record_operations
 from ezsort.models import FileItem
+from ezsort.organizer import execute_operations
+from ezsort.planner import create_plan
+from ezsort.scanner import scan_directory_ex
+from ezsort.utils import is_hidden, path_exists
 
 logger = logging.getLogger(__name__)
+
+#: Event callback: receives a dict with at least ``type`` in
+#: {"detected", "moved", "skipped", "failed", "error", "info"}.
+EventCallback = Callable[[dict], None]
+
+
+def _emit(callback: Optional[EventCallback], payload: dict) -> None:
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:  # pragma: no cover - user callbacks must not kill the loop
+        logger.debug("Watch event callback raised", exc_info=True)
+
+
+def _default_print(payload: dict) -> None:
+    kind = payload.get("type", "info")
+    message = payload.get("message", "")
+    if kind == "moved":
+        print(f"  {message}")
+    elif kind == "failed":
+        print(f"  Failed: {message}")
+    else:
+        print(f"  {message}")
 
 
 def watch_directory(
     directory: Path,
     interval: int = 2,
     recursive: bool = False,
-    config: dict | None = None,
+    config: dict[str, Any] | None = None,
     on_move: Callable[[str], None] | None = None,
+    on_event: Optional[EventCallback] = None,
+    stop_event: Optional[threading.Event] = None,
+    record_history: bool = True,
 ) -> None:
     """Watch a directory and organize new files as they appear.
+
+    A file is only moved once its size and modification time have been
+    stable across two consecutive polls, which prevents sorting away
+    half-downloaded files.
 
     Args:
         directory: Directory to watch.
         interval: Seconds between scans.
         recursive: Whether to watch subdirectories.
         config: Optional configuration.
-        on_move: Optional callback when a file is moved.
+        on_move: Legacy callback invoked with a short message per move.
+        on_event: Detailed callback receiving event dicts (GUI use).
+        stop_event: Set this event to stop watching from another thread.
+        record_history: Record moves to history so they can be undone.
     """
-    import sys
+    interval = max(1, int(interval))
+    stop = stop_event or threading.Event()
 
-    print(f"\n  EzSort Watch Mode")
+    _emit(on_event, {
+        "type": "info",
+        "message": f"Watching {directory} (every {interval}s)",
+    })
+    excluded_dirs = get_excluded_dirs(config)
+    skip_hidden = bool((config or {}).get("skip_hidden", True))
+    skip_partial = bool((config or {}).get("skip_partial_downloads", True))
+    excluded_exts = set(get_excluded_extensions(config))
+    # Excluded extensions are always skipped; partial-download extensions
+    # (.part, .crdownload, ...) are skipped only when enabled in config.
+    partial_exts = set(excluded_exts)
+    if skip_partial:
+        partial_exts |= {e.lower() for e in PARTIAL_DOWNLOAD_EXTENSIONS}
+    print("\n  EzSort Watch Mode")
     print(f"  Watching: {directory}")
-    print(f"  Press Ctrl+C to stop\n")
+    print("  Press Ctrl+C to stop\n")
 
-    known_files: set[Path] = set()
+    # path -> (size, mtime) observed on the previous poll.
+    previous: dict[Path, tuple[int, float]] = {}
+    # Files confirmed stable and already handled (moved or skipped).
+    handled: set[Path] = set()
 
-    # Record existing files
-    try:
-        for entry in directory.iterdir():
-            if entry.is_file() and not entry.is_symlink():
-                known_files.add(entry.resolve())
-    except OSError as e:
-        logger.error("Cannot watch directory: %s", e)
-        return
+    def poll() -> None:
+        nonlocal previous
+        result = scan_directory_ex(
+            directory,
+            recursive=recursive,
+            excluded_dirs=excluded_dirs,
+            skip_hidden=skip_hidden,
+        )
+        for err in result.errors:
+            _emit(on_event, {"type": "error", "message": err})
 
-    try:
-        while True:
-            time.sleep(interval)
-
+        current: dict[Path, tuple[int, float]] = {}
+        for item in result.files:
             try:
-                current_files: set[Path] = set()
-                for entry in directory.iterdir():
-                    if entry.is_file() and not entry.is_symlink():
-                        current_path = entry.resolve()
-                        current_files.add(current_path)
+                stat = item.path.stat()
+            except OSError:
+                continue
+            current[item.path] = (stat.st_size, stat.st_mtime)
 
-                        # New file detected
-                        if current_path not in known_files:
-                            _handle_new_file(entry, directory, config, on_move)
-
-                known_files = current_files
-
-            except OSError as e:
-                logger.error("Error scanning directory: %s", e)
+        # Detect new or changed files.
+        for path, signature in current.items():
+            if path in handled:
+                continue
+            if path not in previous:
+                # First sighting: remember and wait for stability.
+                _emit(on_event, {
+                    "type": "detected",
+                    "message": f"New file detected: {path.name}",
+                    "path": str(path),
+                })
+                continue
+            if previous[path] != signature:
+                # Still being written - wait for the next poll.
                 continue
 
-    except KeyboardInterrupt:
-        print("\n  Watch mode stopped.")
+            # Stable across two polls: safe to handle.
+            handled.add(path)
+            _handle_stable_file(
+                path=path,
+                target_dir=directory,
+                config=config,
+                partial_exts=partial_exts,
+                on_move=on_move,
+                on_event=on_event,
+                record_history=record_history,
+            )
 
+        # Forget files that disappeared (moved away or deleted) so a new
+        # file reusing the same path is watched again.
+        previous = {
+            p: sig for p, sig in current.items() if p not in handled
+        }
+        handled.intersection_update(current)
 
-def _handle_new_file(
-    file_path: Path,
-    target_dir: Path,
-    config: dict | None,
-    on_move: Callable[[str], None] | None,
-) -> None:
-    """Handle a newly detected file."""
-    # Brief wait in case file is still being written
-    time.sleep(0.5)
-
-    if not file_path.exists():
+    # Prime with the initial contents: files that already exist are left
+    # alone (use "Organize" for the existing mess; watch handles new files).
+    try:
+        initial = scan_directory_ex(
+            directory,
+            recursive=recursive,
+            excluded_dirs=excluded_dirs,
+            skip_hidden=skip_hidden,
+        )
+        for item in initial.files:
+            handled.add(item.path)
+    except OSError as e:
+        logger.error("Cannot watch directory: %s", e)
+        _emit(on_event, {"type": "error", "message": f"Cannot watch directory: {e}"})
         return
 
-    item = FileItem(path=file_path)
+    try:
+        while not stop.is_set():
+            if stop.wait(timeout=interval):
+                break
+            try:
+                poll()
+            except OSError as e:
+                logger.error("Error scanning directory: %s", e)
+                _emit(on_event, {"type": "error", "message": f"Scan error: {e}"})
+                continue
+    except KeyboardInterrupt:
+        print("\n  Watch mode stopped.")
+        _emit(on_event, {"type": "info", "message": "Watch mode stopped."})
+        return
+
+    _emit(on_event, {"type": "info", "message": "Watch mode stopped."})
+
+
+def _handle_stable_file(
+    path: Path,
+    target_dir: Path,
+    config: dict[str, Any] | None,
+    partial_exts: set[str],
+    on_move: Callable[[str], None] | None,
+    on_event: Optional[EventCallback],
+    record_history: bool,
+) -> None:
+    """Classify and move one file whose contents have stabilized."""
+    if not path_exists(path):
+        return
+
+    if is_hidden(path) and (config or {}).get("skip_hidden", True):
+        _emit(on_event, {
+            "type": "skipped",
+            "message": f"Skipped hidden file: {path.name}",
+            "path": str(path),
+        })
+        return
+
+    if path.suffix.lower() in partial_exts:
+        _emit(on_event, {
+            "type": "skipped",
+            "message": f"Skipped partial/temporary file: {path.name}",
+            "path": str(path),
+        })
+        return
+
+    item = FileItem(path=path)
     category, reason = classify_file(item, config)
+    plan = create_plan([(item, category, reason)], target_dir)
 
-    print(f"  New file detected: {file_path.name}")
-    print(f"  -> {category}/{file_path.name}")
+    if not plan:
+        _emit(on_event, {
+            "type": "skipped",
+            "message": f"Already organized: {path.name}",
+            "path": str(path),
+        })
+        return
 
-    # Create and execute plan
-    classified = [(item, category, reason)]
-    plan = create_plan(classified, target_dir)
     results = execute_operations(plan, dry_run=False)
 
     if results and results[0].success:
-        print(f"  Moved successfully.\n")
+        final = results[0].operation.destination
+        message = f"Moved {path.name} -> {category}/"
+        print(f"  Moved: {path.name} -> {final.parent.name}/")
+        if record_history:
+            try:
+                record_operations(results, folder=str(target_dir))
+            except Exception:  # pragma: no cover
+                logger.warning("Could not record watch-mode history", exc_info=True)
         if on_move:
-            on_move(f"Moved {file_path.name} to {category}/")
+            on_move(message)
+        _emit(on_event, {
+            "type": "moved",
+            "message": message,
+            "path": str(path),
+            "destination": str(final),
+            "category": category,
+        })
     else:
         error = results[0].error if results else "Unknown error"
-        print(f"  Failed: {error}\n")
+        print(f"  Failed: {error}")
+        _emit(on_event, {
+            "type": "failed",
+            "message": error or "Unknown error",
+            "path": str(path),
+        })

@@ -4,32 +4,56 @@ from __future__ import annotations
 
 import logging
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Optional
 
 from ezsort.models import Operation, OperationResult
-from ezsort.utils import get_unique_destination
+from ezsort.utils import ensure_long_path, get_unique_destination, path_exists
 
 logger = logging.getLogger(__name__)
+
+#: Progress callback: (completed_count, total_count, operation)
+ProgressCallback = Callable[[int, int, Operation], None]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def execute_operations(
     operations: list[Operation],
     dry_run: bool = False,
+    progress: Optional[ProgressCallback] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[OperationResult]:
     """Execute a list of operations.
 
     Args:
         operations: List of Operation objects.
         dry_run: If True, don't actually move files.
+        progress: Optional callback invoked after each operation with
+            ``(completed, total, operation)``.
+        cancel_check: Optional callable; when it returns True the remaining
+            operations are skipped (already-executed ones stay executed).
 
     Returns:
-        List of OperationResult objects.
+        List of OperationResult objects (same order as *operations*).
     """
     results: list[OperationResult] = []
+    total = len(operations)
 
-    for op in operations:
+    for index, op in enumerate(operations, start=1):
+        if cancel_check is not None and cancel_check():
+            logger.info("Execution cancelled after %d/%d operations", index - 1, total)
+            break
         result = execute_single(op, dry_run=dry_run)
         results.append(result)
+        if progress is not None:
+            try:
+                progress(index, total, result.operation)
+            except Exception:  # pragma: no cover - progress must never break runs
+                logger.debug("Progress callback raised", exc_info=True)
 
     return results
 
@@ -40,6 +64,13 @@ def execute_single(
 ) -> OperationResult:
     """Execute a single operation.
 
+    Safety guarantees:
+      * directories are never moved (only regular files),
+      * an existing file at the destination is never overwritten - the
+        incoming file gets a `` (n)`` suffix instead,
+      * the source is verified immediately before the move so a vanished
+        file is reported accurately instead of half-succeeding.
+
     Args:
         operation: The Operation to execute.
         dry_run: If True, don't actually move the file.
@@ -47,11 +78,14 @@ def execute_single(
     Returns:
         OperationResult indicating success or failure.
     """
-    from datetime import datetime, timezone
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = _now()
 
     if dry_run:
-        logger.info("[DRY RUN] Would move: %s -> %s", operation.source.name, operation.destination)
+        logger.info(
+            "[DRY RUN] Would move: %s -> %s",
+            operation.source.name,
+            operation.destination,
+        )
         return OperationResult(
             operation=operation,
             success=True,
@@ -59,13 +93,43 @@ def execute_single(
         )
 
     try:
-        # Ensure destination directory exists
-        operation.destination.parent.mkdir(parents=True, exist_ok=True)
+        # 1. Validate the source before touching anything.
+        if not path_exists(operation.source):
+            return _failure(
+                operation,
+                f"Source file no longer exists: {operation.source}",
+                timestamp,
+            )
+        try:
+            if operation.source.is_dir():
+                return _failure(
+                    operation,
+                    f"Source is a directory, refusing to move it: "
+                    f"{operation.source.name}",
+                    timestamp,
+                )
+        except OSError as e:
+            return _failure(operation, f"Cannot inspect source: {e}", timestamp)
 
-        # Check for existing file and get unique destination
-        final_dest = get_unique_destination(operation.destination)
+        # 2. Ensure destination directory exists (long-path safe).
+        try:
+            Path(ensure_long_path(operation.destination.parent)).mkdir(
+                parents=True, exist_ok=True
+            )
+        except OSError as e:
+            return _failure(
+                operation,
+                f"Cannot create destination folder "
+                f"{operation.destination.parent}: {e}",
+                timestamp,
+            )
 
-        # If destination was renamed due to conflict, update the operation
+        # 3. Never overwrite: re-check the destination right before moving.
+        try:
+            final_dest = get_unique_destination(operation.destination)
+        except RuntimeError as e:
+            return _failure(operation, str(e), timestamp)
+
         if final_dest != operation.destination:
             logger.info(
                 "File already exists at %s, renaming to %s",
@@ -73,49 +137,55 @@ def execute_single(
                 final_dest.name,
             )
 
-        # Move the file
-        shutil.move(str(operation.source), str(final_dest))
+        # 4. Move the file.
+        shutil.move(
+            ensure_long_path(operation.source),
+            ensure_long_path(final_dest),
+        )
 
         logger.info("Moved: %s -> %s", operation.source.name, final_dest.name)
 
+        moved_op = Operation(
+            source=operation.source,
+            destination=final_dest,
+            category=operation.category,
+            reason=operation.reason,
+            operation_id=operation.operation_id,
+            collision=operation.collision or final_dest != operation.destination,
+        )
         return OperationResult(
-            operation=Operation(
-                source=operation.source,
-                destination=final_dest,
-                category=operation.category,
-                reason=operation.reason,
-                operation_id=operation.operation_id,
-            ),
+            operation=moved_op,
             success=True,
             timestamp=timestamp,
         )
 
     except PermissionError as e:
-        error_msg = f"Permission denied: {e}"
-        logger.error("Failed to move %s: %s", operation.source.name, error_msg)
-        return OperationResult(
-            operation=operation,
-            success=False,
-            error=error_msg,
-            timestamp=timestamp,
+        return _failure(
+            operation,
+            f"Permission denied while moving {operation.source.name}: {e}",
+            timestamp,
         )
-
     except OSError as e:
-        error_msg = f"OS error: {e}"
-        logger.error("Failed to move %s: %s", operation.source.name, error_msg)
-        return OperationResult(
-            operation=operation,
-            success=False,
-            error=error_msg,
-            timestamp=timestamp,
+        return _failure(
+            operation,
+            f"OS error while moving {operation.source.name} -> "
+            f"{operation.destination.parent}: {e}",
+            timestamp,
+        )
+    except Exception as e:  # unexpected, but must not abort the whole batch
+        logger.exception("Unexpected error moving %s", operation.source)
+        return _failure(
+            operation,
+            f"Unexpected error moving {operation.source.name}: {e}",
+            timestamp,
         )
 
-    except Exception as e:
-        error_msg = f"Unexpected error: {e}"
-        logger.error("Failed to move %s: %s", operation.source.name, error_msg)
-        return OperationResult(
-            operation=operation,
-            success=False,
-            error=error_msg,
-            timestamp=timestamp,
-        )
+
+def _failure(operation: Operation, error: str, timestamp: str) -> OperationResult:
+    logger.error("Failed to move %s: %s", operation.source.name, error)
+    return OperationResult(
+        operation=operation,
+        success=False,
+        error=error,
+        timestamp=timestamp,
+    )

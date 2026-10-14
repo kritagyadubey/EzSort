@@ -1,7 +1,7 @@
 """Tests for the CLI module."""
 
 import pytest
-from pathlib import Path
+from ezsort import __version__
 from ezsort.cli import main
 
 
@@ -19,7 +19,7 @@ def test_cli_version(capsys):
         main(["--version"])
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
-    assert "0.1.0" in captured.out
+    assert __version__ in captured.out
 
 
 def test_cli_help(capsys):
@@ -106,7 +106,7 @@ def test_cli_version_command(capsys):
     result = main(["version"])
     assert result == 0
     captured = capsys.readouterr()
-    assert "0.1.0" in captured.out
+    assert __version__ in captured.out
 
 
 def test_cli_organize_with_unicode(cli_dir):

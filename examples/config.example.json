@@ -1,9 +1,5 @@
-# Example EzSort Configuration
-# Place this file at:
-#   Windows: %APPDATA%/EzSort/config.json
-#   Linux/macOS: ~/.config/ezsort/config.json
-
 {
+  "_readme": "Example EzSort configuration. Save as config.json at: Windows %APPDATA%/EzSort/config.json, Linux/macOS ~/.config/ezsort/config.json. Every key is optional - omitted keys use the defaults shown here.",
   "categories": {
     "Images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".ico"],
     "Videos": [".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv"],
@@ -21,6 +17,8 @@
   "excluded_dirs": [".git", "node_modules", "__pycache__", ".venv", "venv"],
   "excluded_extensions": [],
   "duplicate_strategy": "rename",
+  "skip_hidden": true,
+  "skip_partial_downloads": true,
   "confirm_before_move": true,
   "watch_interval": 2,
   "custom_rules": [

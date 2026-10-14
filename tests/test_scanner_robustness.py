@@ -56,15 +56,19 @@ def test_skip_hidden_toggle(tmp_path):
 
 
 def test_scan_does_not_follow_symlinked_directories(tmp_path):
-    real_dir = tmp_path / "real"
-    real_dir.mkdir()
-    (real_dir / "inside.txt").write_text("x")
-    link = tmp_path / "linked"
+    # Real content lives OUTSIDE the scanned tree; the only way to reach
+    # it would be by following the symlink.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "inside.txt").write_text("x")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    link = tree / "linked"
     try:
-        link.symlink_to(real_dir, target_is_directory=True)
+        link.symlink_to(outside, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks not supported")  # type: ignore[undefined]
-    result = scan_directory_ex(tmp_path, recursive=True)
+    result = scan_directory_ex(tree, recursive=True)
     names = {f.path.name for f in result.files}
     assert "inside.txt" not in names  # not reached through the link
     assert result.symlink_skipped >= 1

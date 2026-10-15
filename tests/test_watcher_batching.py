@@ -40,13 +40,15 @@ def _run_watch(folder, *, interval: int = 1, config=None, on_event=None,
     return thread, stop, events
 
 
-def _wait_for(predicate, timeout: float = 30.0) -> bool:
+def _wait_for(predicate, timeout: float = 60.0) -> bool:
     """Poll ``predicate`` until true or ``timeout``. Never raises.
 
     Non-raising on purpose: every test here stops and joins its watcher
     *before* judging the outcome, so a slow-but-correct move still counts
     (antivirus can hold a rename for tens of seconds on CI) and a thread left
     behind cannot flush its batch into the next test's ``EZSORT_HOME``.
+    The budget is generous because it is only spent when something is already
+    wrong - the healthy path returns the moment it succeeds.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -54,6 +56,18 @@ def _wait_for(predicate, timeout: float = 30.0) -> bool:
             return True
         time.sleep(0.15)
     return False
+
+
+def _stopped(events: list[dict]) -> bool:
+    """True once the watcher has flushed and announced it is winding down.
+
+    The watcher emits this message only *after* ``flush_history()`` has
+    written the batch, and it is the last thing the function does. Waiting on
+    it - rather than on thread liveness - absorbs the stalls a runner's
+    antivirus puts on those writes, while still proving the history record
+    exists and the thread is about to exit.
+    """
+    return any("stopped" in str(e.get("message", "")).lower() for e in events)
 
 
 def _batches_for(folder: Path) -> list[dict]:
@@ -85,6 +99,14 @@ def test_watch_batches_one_wave_into_one_history(tmp_path):
     finally:
         stop.set()
         thread.join(timeout=30)
+    # Judge shutdown by the watcher's own post-flush "stopped" announcement
+    # rather than raw thread liveness: that flush is the file write a CI
+    # runner's antivirus stalls.
+    assert _wait_for(lambda: _stopped(events)), (
+        f"watcher never finished stopping; "
+        f"events={[e.get('message') for e in events]}"
+    )
+    thread.join(timeout=10)
     assert not thread.is_alive()
 
     # The quiet poll after the burst flushes the wave as one batch, so
@@ -116,6 +138,11 @@ def test_watch_separate_waves_create_separate_batches(tmp_path):
     finally:
         stop.set()
         thread.join(timeout=30)
+    assert _wait_for(lambda: _stopped(events)), (
+        f"watcher never finished stopping; "
+        f"events={[e.get('message') for e in events]}"
+    )
+    thread.join(timeout=10)
     assert not thread.is_alive()
 
     history = _batches_for(folder)
@@ -141,6 +168,14 @@ def test_watch_echo_false_prints_nothing(tmp_path):
         finally:
             stop.set()
             thread.join(timeout=30)
+        # Stay inside the redirect while the watcher winds down: a move that
+        # completes late still prints inside this window, so the buffer - not
+        # the terminal - is where any stray output would land.
+        assert _wait_for(lambda: _stopped(events)), (
+            f"watcher never finished stopping; "
+            f"events={[e.get('message') for e in events]}"
+        )
+        thread.join(timeout=10)
     assert not thread.is_alive()
     # The move must really have happened - otherwise "nothing was printed"
     # would pass vacuously.
@@ -158,7 +193,7 @@ def test_watch_echo_true_still_prints(tmp_path):
     folder.mkdir()
     buffer = io.StringIO()
     with redirect_stdout(buffer):
-        thread, stop, _ = _run_watch(folder, echo=True)
+        thread, stop, events = _run_watch(folder, echo=True)
         try:
             time.sleep(1.4)
             (folder / "loud.pdf").write_bytes(b"pdf")
@@ -166,6 +201,12 @@ def test_watch_echo_true_still_prints(tmp_path):
         finally:
             stop.set()
             thread.join(timeout=30)
+        # Inside the redirect: a late move's output must still land in buffer.
+        assert _wait_for(lambda: _stopped(events)), (
+            f"watcher never finished stopping; "
+            f"events={[e.get('message') for e in events]}"
+        )
+        thread.join(timeout=10)
     assert not thread.is_alive()
     out = buffer.getvalue()
     assert "EzSort Watch Mode" in out
@@ -188,6 +229,11 @@ def test_watch_flushes_pending_history_on_stop(tmp_path):
     finally:
         stop.set()
         thread.join(timeout=30)
+    assert _wait_for(lambda: _stopped(events)), (
+        f"watcher never finished stopping; "
+        f"events={[e.get('message') for e in events]}"
+    )
+    thread.join(timeout=10)
     assert not thread.is_alive()
 
     history = _batches_for(folder)

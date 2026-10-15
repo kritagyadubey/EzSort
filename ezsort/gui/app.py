@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -30,6 +31,36 @@ NAV_ITEMS = [
 MAX_ACTIVITY = 500
 
 
+def app_icon_path() -> Optional[Path]:
+    """Locate the bundled application icon (source tree or frozen EXE).
+
+    PyInstaller stores data files under ``sys._MEIPASS``; when running from
+    source the icon lives in ``packaging/``. Returns None when the icon
+    cannot be found so callers can degrade gracefully.
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):  # PyInstaller bundle
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            # packaging/ezsort-gui.spec bundles the icon into the
+            # "packaging" folder inside the bundle; the root is kept as a
+            # fallback in case a spec ever places it there instead.
+            candidates.append(Path(meipass) / "packaging" / "ezsort.ico")
+            candidates.append(Path(meipass) / "ezsort.ico")
+        candidates.append(Path(sys.executable).with_suffix(".ico"))
+    else:
+        candidates.append(
+            Path(__file__).resolve().parents[2] / "packaging" / "ezsort.ico"
+        )
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:  # pragma: no cover - unreadable install dir
+            continue
+    return None
+
+
 class EzSortApp:
     """The EzSort desktop application."""
 
@@ -38,6 +69,7 @@ class EzSortApp:
         self.root.title(f"EzSort {__version__}")
         self.root.minsize(980, 640)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._set_window_icon()
 
         self._enable_dpi_awareness()
 
@@ -52,7 +84,12 @@ class EzSortApp:
         self.activity: list[dict] = []
         self.runner = TaskRunner(self.root)
         self._task_lock = threading.Lock()
-        self._cancel_token: Optional[CancelToken] = None
+        #: One cancel token per running task (label -> token), so a
+        #: background watch can never hijack the organize cancel button.
+        self._cancel_tokens: dict[str, CancelToken] = {}
+        #: Labels of currently running tasks (in start order); the busy
+        #: indicator reflects whatever is still alive.
+        self._running_labels: list[str] = []
         self._active_label = ""
         self._status_job: Optional[str] = None
         self.watching = False
@@ -63,6 +100,7 @@ class EzSortApp:
         # --- chrome ------------------------------------------------------
         apply_styles(self.root, self.palette)
         self._build_layout()
+        self._bind_shortcuts()
         self._restore_geometry()
         self.show_page("dashboard")
 
@@ -72,12 +110,55 @@ class EzSortApp:
 
     @staticmethod
     def _enable_dpi_awareness() -> None:
+        """Make the window crisp on high-DPI and mixed-scale displays.
+
+        Per-monitor v2 is preferred (correct on mixed 100%/150% setups);
+        older Windows 10 builds fall back to system-DPI awareness.
+        """
+        try:
+            import ctypes
+
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4
+            if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+        except Exception:
+            pass
         try:
             import ctypes
 
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
         except Exception:
             pass
+
+    def _set_window_icon(self) -> None:
+        """Use the real EzSort icon for the window (title bar, taskbar)."""
+        icon = app_icon_path()
+        if icon is None:
+            return
+        try:
+            self.root.iconbitmap(str(icon))
+        except Exception:  # pragma: no cover - never block startup on an icon
+            logger.debug("Could not set window icon", exc_info=True)
+
+    def _bind_shortcuts(self) -> None:
+        """Keyboard navigation: Ctrl+1..6 jump to pages, F5 refreshes."""
+        for index, (key, _label) in enumerate(NAV_ITEMS, start=1):
+            self.root.bind_all(
+                f"<Control-Key-{index}>",
+                lambda _e, k=key: self.show_page(k),
+            )
+        self.root.bind_all("<F5>", self._refresh_current_page)
+
+    def _refresh_current_page(self, _event=None) -> None:
+        page = self.pages.get(self.current_page)
+        if page is None:
+            return
+        refresh = getattr(page, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                logger.exception("page refresh failed")
 
     def _build_layout(self) -> None:
         p = self.palette
@@ -92,22 +173,34 @@ class EzSortApp:
 
         brand = tk.Frame(self.sidebar, bg=p["sidebar"])
         brand.pack(fill="x", padx=18, pady=(22, 4))
-        tk.Label(
+        brand_title = tk.Label(
             brand, text="EzSort", bg=p["sidebar"], fg=p["text"],
             font=("Segoe UI", 19, "bold"), anchor="w",
-        ).pack(side="left")
-        tk.Label(
+        )
+        brand_title.pack(side="left")
+        brand_version = tk.Label(
             brand, text=f"v{__version__}", bg=p["sidebar"], fg=p["muted"],
             font=("Segoe UI", 9),
-        ).pack(side="right", pady=(8, 0))
-        tk.Label(
+        )
+        brand_version.pack(side="right", pady=(8, 0))
+        brand_tagline = tk.Label(
             self.sidebar, text="Keep your files sorted,\neffortlessly.",
             bg=p["sidebar"], fg=p["muted"], font=("Segoe UI", 9),
             justify="left", anchor="w",
-        ).pack(fill="x", padx=18, pady=(2, 18))
+        )
+        brand_tagline.pack(fill="x", padx=18, pady=(2, 18))
+        # Kept so a theme switch can recolor the brand block (it is plain
+        # tk widgets, not ttk, so ttk styles alone never reach it).
+        self._brand_widgets = [
+            (brand, "sidebar", None),
+            (brand_title, "sidebar", "text"),
+            (brand_version, "sidebar", "muted"),
+            (brand_tagline, "sidebar", "muted"),
+        ]
 
         sep = tk.Frame(self.sidebar, bg=p["border"], height=1)
         sep.pack(fill="x", padx=14, pady=(0, 8))
+        self._sidebar_separators = [sep]
 
         self._nav_buttons: dict[str, dict] = {}
         for key, label in NAV_ITEMS:
@@ -132,12 +225,12 @@ class EzSortApp:
         # Sidebar footer: folder + engine status
         sep2 = tk.Frame(self.sidebar, bg=p["border"], height=1)
         sep2.pack(side="bottom", fill="x", padx=14, pady=8)
+        self._sidebar_separators.append(sep2)
         self.sidebar_status = tk.Label(
             self.sidebar, text="Ready", bg=p["sidebar"], fg=p["muted"],
             font=("Segoe UI", 9), anchor="w", justify="left", wraplength=190,
         )
         self.sidebar_status.pack(side="bottom", fill="x", padx=18, pady=(4, 16))
-
         # Content area
         self.container = tk.Frame(self.root, bg=p["bg"])
         self.container.grid(row=0, column=1, sticky="nsew")
@@ -262,17 +355,39 @@ class EzSortApp:
             self.watching = True
 
     def end_busy(self, label: str = "") -> None:
+        """Clear the busy indicator once no task needs it anymore.
+
+        Other tasks (e.g. watch mode) may still be running, so the
+        indicator switches to whatever remains instead of lying about
+        the app being idle.
+        """
         if self.watching and label == "watching":
             self.watching = False
-        remaining = self.runner.busy
-        if not remaining:
-            self.task_label.configure(text="", fg=self.palette["muted"])
+        if self._running_labels:
+            # Something else is still running - keep an honest indicator.
+            current = self._running_labels[-1]
+            self.task_label.configure(text=f"{current}…", fg=self.palette["accent"])
             self.sidebar_status.configure(
                 text=(
                     f"Watching:\n{short_path(str(self.folder), 34)}"
-                    if self.watching else "Ready"
+                    if self.watching else f"Busy: {current}"
                 )
             )
+            return
+        self.task_label.configure(text="", fg=self.palette["muted"])
+        self.sidebar_status.configure(
+            text=(
+                f"Watching:\n{short_path(str(self.folder), 34)}"
+                if self.watching else "Ready"
+            )
+        )
+
+    def _discard_label(self, label: str) -> None:
+        """Forget one running-task entry (labels may repeat)."""
+        try:
+            self._running_labels.remove(label)
+        except ValueError:
+            pass
 
     def start_task(
         self,
@@ -294,7 +409,8 @@ class EzSortApp:
             return False
 
         token = CancelToken()
-        self._cancel_token = token
+        self._cancel_tokens[label] = token
+        self._running_labels.append(label)
         self.set_busy(label)
 
         def wrapped():
@@ -309,9 +425,10 @@ class EzSortApp:
                 if on_done:
                     on_done(result)
             finally:
+                self._discard_label(label)
                 self.end_busy(label)
-                if self._cancel_token is token:
-                    self._cancel_token = None
+                if self._cancel_tokens.get(label) is token:
+                    self._cancel_tokens.pop(label, None)
 
         def failed(exc):
             try:
@@ -321,23 +438,27 @@ class EzSortApp:
                     self.toast(f"{label} failed: {exc}", "error")
                     logger.exception("%s failed", label)
             finally:
+                self._discard_label(label)
                 self.end_busy(label)
-                if self._cancel_token is token:
-                    self._cancel_token = None
+                if self._cancel_tokens.get(label) is token:
+                    self._cancel_tokens.pop(label, None)
 
         self.runner.submit(wrapped, on_done=done, on_error=failed)
         return True
 
-    @property
-    def cancel_token(self) -> Optional[CancelToken]:
-        return self._cancel_token
+    def cancel_token_for(self, label: str) -> Optional[CancelToken]:
+        """Cancel token of a specific running task (None when absent)."""
+        return self._cancel_tokens.get(label)
 
     def cancel_current(self) -> None:
-        if self._cancel_token:
-            self._cancel_token.cancel()
+        """Cancel the cancellable task (organizing). Scans/undo finish fast
+        on their own; watch mode is stopped from the Organizer page."""
+        token = self._cancel_tokens.get("organizing")
+        if token is not None:
+            token.cancel()
             self.toast("Cancelling - finishing the current file first…", "warning")
         else:
-            self.toast("Nothing is running.", "info")
+            self.toast("Nothing cancellable is running.", "info")
 
     def is_busy(self) -> bool:
         """True while an exclusive (file-mutating) task is running."""
@@ -394,6 +515,20 @@ class EzSortApp:
         self.status_label.configure(bg=p["surface"], fg=p["muted"])
         self.task_label.configure(bg=p["surface"], fg=p["muted"])
         self.sidebar_status.configure(bg=p["sidebar"], fg=p["muted"])
+        # The brand block and separators are plain tk widgets (ttk styles
+        # never reach them), so recolor them explicitly.
+        for widget, bg_role, fg_role in self._brand_widgets:
+            try:
+                widget.configure(bg=p[bg_role])
+                if fg_role:
+                    widget.configure(fg=p[fg_role])
+            except tk.TclError:  # pragma: no cover - widget destroyed
+                pass
+        for sep_widget in self._sidebar_separators:
+            try:
+                sep_widget.configure(bg=p["border"])
+            except tk.TclError:  # pragma: no cover - widget destroyed
+                pass
         # Force every page to re-skin itself.
         for page in self.pages.values():
             try:

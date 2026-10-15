@@ -162,8 +162,41 @@ def main() -> int:
         if children:
             cats.rule_tree.selection_set(children[0])
             cats._on_rule_select()
+        # Rules are ordered: move the selected rule down and back up.
+        cats.move_rule(1)
+        app.root.update()
+        check(len(cats.rule_tree.get_children()) == 1, "rule survives reorder")
         cats.remove_rule()
         check(len(app.config.get("custom_rules", [])) == 0, "custom rule removed")
+        _screenshot(SCREENSHOTS / "categories.png", app)
+
+        # --- partial-download checkbox writes the right flag ----------
+        organizer.sync_options_from_config()
+        organizer.partial_var.set(True)
+        organizer._partial_changed()
+        check(app.config.get("skip_partial_downloads") is False,
+              "'sort partials too' checkbox stores skip=False")
+        organizer.partial_var.set(False)
+        organizer._partial_changed()
+        check(app.config.get("skip_partial_downloads") is True,
+              "unchecking restores skip=True")
+
+        # --- per-task cancel tokens -----------------------------------
+        from ezsort.gui.workers import CancelToken
+
+        watch_token = CancelToken()
+        app._cancel_tokens["watching"] = watch_token
+        app.cancel_current()
+        check(not watch_token.cancelled,
+              "cancel button never cancels a watch task")
+        app._cancel_tokens.pop("watching", None)
+
+        # --- activity cancel button is honest -------------------------
+        activity_page = app.pages["activity"]
+        activity_page._poll_cancel_state()
+        app.root.update()
+        check("disabled" in activity_page.cancel_btn.state(),
+              "cancel button disabled while idle")
 
         # --- settings + theme switch ---------------------------------
         app.show_page("settings")
@@ -192,6 +225,26 @@ def main() -> int:
         app.show_page("dashboard")
         app.root.update()
         _screenshot(SCREENSHOTS / "dashboard.png", app)
+        app.show_page("activity")
+        app.root.update()
+        _screenshot(SCREENSHOTS / "activity.png", app)
+
+        # --- light theme screenshots (the redesign must work in both) --
+        app.show_page("settings")
+        settings.theme_var.set("light")
+        settings._theme_changed()
+        app.root.update()
+        app.show_page("dashboard")
+        app.root.update()
+        _screenshot(SCREENSHOTS / "dashboard-light.png", app)
+        app.show_page("organizer")
+        app.root.update()
+        _screenshot(SCREENSHOTS / "organizer-light.png", app)
+        # Leave the app in dark mode (the documented default).
+        app.show_page("settings")
+        settings.theme_var.set("dark")
+        settings._theme_changed()
+        app.root.update()
 
     except Exception:
         traceback.print_exc()

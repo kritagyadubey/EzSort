@@ -33,17 +33,6 @@ def _emit(callback: Optional[EventCallback], payload: dict) -> None:
         logger.debug("Watch event callback raised", exc_info=True)
 
 
-def _default_print(payload: dict) -> None:
-    kind = payload.get("type", "info")
-    message = payload.get("message", "")
-    if kind == "moved":
-        print(f"  {message}")
-    elif kind == "failed":
-        print(f"  Failed: {message}")
-    else:
-        print(f"  {message}")
-
-
 def watch_directory(
     directory: Path,
     interval: int = 2,
@@ -53,6 +42,7 @@ def watch_directory(
     on_event: Optional[EventCallback] = None,
     stop_event: Optional[threading.Event] = None,
     record_history: bool = True,
+    echo: bool = True,
 ) -> None:
     """Watch a directory and organize new files as they appear.
 
@@ -69,6 +59,8 @@ def watch_directory(
         on_event: Detailed callback receiving event dicts (GUI use).
         stop_event: Set this event to stop watching from another thread.
         record_history: Record moves to history so they can be undone.
+        echo: Print banner/progress to stdout (CLI). The GUI passes False:
+            writes to stdout are useless (and risky) in a windowed EXE.
     """
     interval = max(1, int(interval))
     stop = stop_event or threading.Event()
@@ -86,16 +78,41 @@ def watch_directory(
     partial_exts = set(excluded_exts)
     if skip_partial:
         partial_exts |= {e.lower() for e in PARTIAL_DOWNLOAD_EXTENSIONS}
-    print("\n  EzSort Watch Mode")
-    print(f"  Watching: {directory}")
-    print("  Press Ctrl+C to stop\n")
+    if echo:
+        print("\n  EzSort Watch Mode")
+        print(f"  Watching: {directory}")
+        print("  Press Ctrl+C to stop\n")
 
     # path -> (size, mtime) observed on the previous poll.
     previous: dict[Path, tuple[int, float]] = {}
     # Files confirmed stable and already handled (moved or skipped).
     handled: set[Path] = set()
+    # Moves waiting to be written to history as one batch per "wave" of
+    # downloads (instead of one history batch - and one full file rewrite -
+    # per moved file).
+    pending_results: list = []
 
-    def poll() -> None:
+    def flush_history() -> None:
+        """Record every move accumulated since the last flush as one batch."""
+        if not pending_results:
+            return
+        batch = pending_results[:]
+        pending_results.clear()
+        if record_history:
+            try:
+                batch_id = record_operations(batch, folder=str(directory))
+                _emit(on_event, {
+                    "type": "info",
+                    "message": (
+                        f"Recorded batch {batch_id}: "
+                        f"{len(batch)} watched file(s) organized"
+                    ),
+                })
+            except Exception:  # pragma: no cover - never lose the run itself
+                logger.warning("Could not record watch-mode history", exc_info=True)
+
+    def poll() -> int:
+        """One scan pass. Returns how many files were handled this poll."""
         nonlocal previous
         result = scan_directory_ex(
             directory,
@@ -114,6 +131,7 @@ def watch_directory(
                 continue
             current[item.path] = (stat.st_size, stat.st_mtime)
 
+        handled_now = 0
         # Detect new or changed files.
         for path, signature in current.items():
             if path in handled:
@@ -132,15 +150,17 @@ def watch_directory(
 
             # Stable across two polls: safe to handle.
             handled.add(path)
-            _handle_stable_file(
+            handled_now += 1
+            results = _handle_stable_file(
                 path=path,
                 target_dir=directory,
                 config=config,
                 partial_exts=partial_exts,
                 on_move=on_move,
                 on_event=on_event,
-                record_history=record_history,
+                echo=echo,
             )
+            pending_results.extend(results)
 
         # Forget files that disappeared (moved away or deleted) so a new
         # file reusing the same path is watched again.
@@ -148,6 +168,7 @@ def watch_directory(
             p: sig for p, sig in current.items() if p not in handled
         }
         handled.intersection_update(current)
+        return handled_now
 
     # Prime with the initial contents: files that already exist are left
     # alone (use "Organize" for the existing mess; watch handles new files).
@@ -170,16 +191,22 @@ def watch_directory(
             if stop.wait(timeout=interval):
                 break
             try:
-                poll()
+                moved_now = poll()
             except OSError as e:
                 logger.error("Error scanning directory: %s", e)
                 _emit(on_event, {"type": "error", "message": f"Scan error: {e}"})
                 continue
+            # A quiet poll after a productive one means the wave of
+            # downloads has landed: record it as a single undoable batch.
+            if pending_results and moved_now == 0:
+                flush_history()
     except KeyboardInterrupt:
         print("\n  Watch mode stopped.")
         _emit(on_event, {"type": "info", "message": "Watch mode stopped."})
+        flush_history()
         return
 
+    flush_history()
     _emit(on_event, {"type": "info", "message": "Watch mode stopped."})
 
 
@@ -190,11 +217,15 @@ def _handle_stable_file(
     partial_exts: set[str],
     on_move: Callable[[str], None] | None,
     on_event: Optional[EventCallback],
-    record_history: bool,
-) -> None:
-    """Classify and move one file whose contents have stabilized."""
+    echo: bool = True,
+) -> list:
+    """Classify and move one file whose contents have stabilized.
+
+    Returns the (possibly empty) list of OperationResults; history
+    recording is the caller's job so related moves can be batched.
+    """
     if not path_exists(path):
-        return
+        return []
 
     if is_hidden(path) and (config or {}).get("skip_hidden", True):
         _emit(on_event, {
@@ -202,7 +233,7 @@ def _handle_stable_file(
             "message": f"Skipped hidden file: {path.name}",
             "path": str(path),
         })
-        return
+        return []
 
     if path.suffix.lower() in partial_exts:
         _emit(on_event, {
@@ -210,7 +241,7 @@ def _handle_stable_file(
             "message": f"Skipped partial/temporary file: {path.name}",
             "path": str(path),
         })
-        return
+        return []
 
     item = FileItem(path=path)
     category, reason = classify_file(item, config)
@@ -222,19 +253,15 @@ def _handle_stable_file(
             "message": f"Already organized: {path.name}",
             "path": str(path),
         })
-        return
+        return []
 
     results = execute_operations(plan, dry_run=False)
 
     if results and results[0].success:
         final = results[0].operation.destination
         message = f"Moved {path.name} -> {category}/"
-        print(f"  Moved: {path.name} -> {final.parent.name}/")
-        if record_history:
-            try:
-                record_operations(results, folder=str(target_dir))
-            except Exception:  # pragma: no cover
-                logger.warning("Could not record watch-mode history", exc_info=True)
+        if echo:
+            print(f"  Moved: {path.name} -> {final.parent.name}/")
         if on_move:
             on_move(message)
         _emit(on_event, {
@@ -246,9 +273,11 @@ def _handle_stable_file(
         })
     else:
         error = results[0].error if results else "Unknown error"
-        print(f"  Failed: {error}")
+        if echo:
+            print(f"  Failed: {error}")
         _emit(on_event, {
             "type": "failed",
             "message": error or "Unknown error",
             "path": str(path),
         })
+    return results

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ezsort import engine
 from ezsort.gui.pages import Page
-from ezsort.gui.theme import short_path
+from ezsort.gui.theme import configure_tree_tags, row_tag, short_path
 from ezsort.gui.widgets import Card, ToolTip, clear_tree, set_tree_columns
 from ezsort.watcher import watch_directory
 
@@ -28,6 +28,12 @@ class OrganizerPage(Page):
         self.preview: Optional[engine.PreviewResult] = None
         self.running = False
         self._item_ops: dict[str, object] = {}
+        #: O(1) lookup from source path -> tree item id while a run is in
+        #: progress (avoids rescanning the whole table per moved file).
+        self._op_items: dict[str, str] = {}
+        #: Monotonic id for scans; a result whose id no longer matches has
+        #: been superseded and must not touch the table.
+        self._scan_seq = 0
         self._build()
         self._seed_from_app()
 
@@ -38,6 +44,12 @@ class OrganizerPage(Page):
     def _build(self) -> None:
         body = self.body
         body.columnconfigure(0, weight=1)
+        # Page.__init__ gives body row 0 weight=1 (fine for pages that put a
+        # single widget there). This page instead needs the *table* row to
+        # absorb all extra height, and to be the only row that shrinks in a
+        # short window. Leaving row 0 weighted made grid squash the options
+        # card - clipping the scan summary in half.
+        body.rowconfigure(0, weight=0)
         body.rowconfigure(3, weight=1)
 
         # -- folder + options card ---------------------------------------
@@ -82,12 +94,23 @@ class OrganizerPage(Page):
             opts, text="Include hidden files", variable=self.hidden_var,
             style="Surface.TCheckbutton", command=self._options_changed,
         ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
+        self.partial_var = tk.BooleanVar(
+            # Inverted: the checkbox offers to *sort* partial downloads,
+            # while the config flag means "skip unfinished downloads".
+            value=not bool(self.app.config.get("skip_partial_downloads", True))
+        )
+        partial_cb = ttk.Checkbutton(
             opts,
-            text="Sort partial downloads (.crdownload, .part …) too",
-            variable=self._partial_var(), style="Surface.TCheckbutton",
+            text="Sort unfinished downloads (.crdownload, .part …) too",
+            variable=self.partial_var, style="Surface.TCheckbutton",
             command=self._partial_changed,
-        ).pack(side="left", padx=(16, 0))
+        )
+        partial_cb.pack(side="left", padx=(16, 0))
+        ToolTip(
+            partial_cb,
+            "Off: files that look like a half-finished download are left "
+            "alone so they are never sorted mid-download.",
+        )
 
         self.summary_var = tk.StringVar(value="No folder selected.")
         summary = ttk.Label(
@@ -145,7 +168,7 @@ class OrganizerPage(Page):
 
         self.tree = ttk.Treeview(
             tree_frame, columns=[c[0] for c in columns], show="headings",
-            selectmode="browse",
+            selectmode="browse", height=8,
         )
         set_tree_columns(self.tree, columns)
         vsb = ttk.Scrollbar(
@@ -157,9 +180,8 @@ class OrganizerPage(Page):
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        self.tree.tag_configure("failed", foreground=self.app.palette["danger"])
-        self.tree.tag_configure("moved", foreground=self.app.palette["success"])
-        self.tree.tag_configure("rename", foreground=self.app.palette["warning"])
+        configure_tree_tags(self.tree, self.app.palette)
+        self.tree.tag_configure("pending", foreground=self.app.palette["text"])
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
         self.detail_var = tk.StringVar(value="Select a row to see full paths.")
@@ -170,15 +192,13 @@ class OrganizerPage(Page):
         detail.grid(row=2, column=0, sticky="w", pady=(6, 0))
         ToolTip(detail, lambda: self.detail_var.get())
 
-    def _partial_var(self) -> tk.BooleanVar:
-        if not hasattr(self, "_partial"):
-            self._partial = tk.BooleanVar(
-                value=bool(self.app.config.get("skip_partial_downloads", True))
-            )
-        return self._partial
-
     def _partial_changed(self) -> None:
-        self.app.update_config(skip_partial_downloads=bool(self._partial.get()))
+        # Checkbox offers to *sort* partial downloads; the config flag means
+        # "skip unfinished downloads", so the stored value is the inverse.
+        self.app.update_config(
+            skip_partial_downloads=not bool(self.partial_var.get())
+        )
+        self._options_changed()
 
     def _seed_from_app(self) -> None:
         if self.app.folder:
@@ -190,6 +210,8 @@ class OrganizerPage(Page):
 
     def set_folder(self, folder: Path) -> None:
         self.folder_var.set(str(folder))
+        # Invalidate any scan that is still in flight for the old folder.
+        self._scan_seq += 1
         self.preview = None
         self.sort_btn.state(["disabled"])
         clear_tree(self.tree)
@@ -214,14 +236,24 @@ class OrganizerPage(Page):
         self.preview_folder()
 
     def _options_changed(self) -> None:
-        # Invalidate an old preview when the options change.
+        # Invalidate an old preview when the options change so the table
+        # never shows a stale plan that no longer matches the settings.
+        # Never mid-run: the executing plan must stay intact until done.
+        if self.running:
+            return
         if self.preview is not None:
             self.preview = None
             self.sort_btn.state(["disabled"])
             clear_tree(self.tree)
+            self._item_ops.clear()
+            self._op_items.clear()
+            self.detail_var.set("Select a row to see full paths.")
             self.summary_var.set(
                 "Options changed - run Preview again to refresh the plan."
             )
+        # A scan started under the old options must not repopulate the
+        # table with a plan that no longer matches the settings.
+        self._scan_seq += 1
 
     def _current_options(self) -> dict:
         config = dict(self.app.config)
@@ -245,11 +277,18 @@ class OrganizerPage(Page):
 
         self.summary_var.set(f"Scanning {short_path(str(folder), 90)} …")
         self.sort_btn.state(["disabled"])
+        # Tag this scan so a result that arrives after the user has already
+        # moved on (picked another folder / started another scan) is dropped
+        # instead of showing a plan for the wrong folder.
+        self._scan_seq += 1
+        seq = self._scan_seq
 
         def work():
             return engine.build_preview(folder, config=config, recursive=recursive)
 
         def done(preview: engine.PreviewResult):
+            if seq != self._scan_seq:
+                return  # superseded by a newer scan or a new folder
             self.preview = preview
             self._populate(preview)
             self.app.log({
@@ -273,18 +312,25 @@ class OrganizerPage(Page):
                 self.app.toast("Everything is already organized.", "success")
 
         def failed(exc: BaseException):
+            if seq != self._scan_seq:
+                return  # a newer scan owns the UI now
             self.summary_var.set(f"Scan failed: {exc}")
             self.app.toast(f"Scan failed: {exc}", "error")
             self.app.log({"type": "error", "message": f"Scan failed: {exc}"})
 
-        self.app.start_task("scanning", work, on_done=done, on_error=failed)
+        if not self.app.start_task(
+            "scanning", work, on_done=done, on_error=failed
+        ):
+            # Engine busy - don't leave the summary claiming a scan started.
+            self.summary_var.set("Another operation is running - try again shortly.")
 
     def _populate(self, preview: engine.PreviewResult) -> None:
         clear_tree(self.tree)
         self._item_ops.clear()
+        self._op_items.clear()
         folder = preview.folder
 
-        for op in preview.operations:
+        for index, op in enumerate(preview.operations):
             try:
                 rel_source = str(op.source.relative_to(folder))
             except ValueError:
@@ -295,14 +341,18 @@ class OrganizerPage(Page):
                 rel_dest = str(op.destination)
 
             status = "Rename (name exists)" if op.collision else "Move"
+            tags = list(row_tag(index))
+            if op.collision:
+                tags.append("rename")
             item = self.tree.insert(
                 "", "end",
                 values=(rel_source, op.category.split("/")[0], rel_dest, status),
-                tags=("rename",) if op.collision else (),
+                tags=tuple(tags),
             )
             self._item_ops[item] = op
+            self._op_items[str(op.source)] = item
 
-        for path, reason in preview.skipped:
+        for index, (path, reason) in enumerate(preview.skipped):
             name = path.name
             try:
                 name = str(path.relative_to(folder))
@@ -311,7 +361,7 @@ class OrganizerPage(Page):
             item = self.tree.insert(
                 "", "end",
                 values=(name, "-", "-", f"Skipped: {reason}"),
-                tags=("moved",),
+                tags=(*row_tag(len(preview.operations) + index), "skipped"),
             )
             self._item_ops[item] = None
 
@@ -366,6 +416,10 @@ class OrganizerPage(Page):
             ):
                 return
 
+        # Capture the folder now: the user may pick a different folder while
+        # this run is in progress, and the completion message must describe
+        # the run that actually happened.
+        run_folder = preview.folder
         self.running = True
         self.sort_btn.state(["disabled"])
         self.cancel_btn.state(["!disabled"])
@@ -379,11 +433,16 @@ class OrganizerPage(Page):
             emit({"type": "progress", "done": done_count, "total": total_count,
                   "source": str(op.source), "destination": str(op.destination)})
 
-        def cancel_check():
-            token = self.app.cancel_token
-            return token is not None and token.cancelled
-
         def work():
+            # start_task() creates and registers the "organizing" token
+            # before this worker is submitted, so it is always available
+            # here. Looking it up (instead of capturing one up front)
+            # keeps the cancel button wired to the token this run owns.
+            token = self.app.cancel_token_for("organizing")
+
+            def cancel_check() -> bool:
+                return bool(token is not None and token.cancelled)
+
             return engine.run_plan(
                 preview,
                 dry_run=False,
@@ -393,12 +452,20 @@ class OrganizerPage(Page):
             )
 
         def done(summary: engine.ExecutionSummary):
-            self._finish_run(summary)
+            self._finish_run(summary, folder=run_folder)
 
         def failed(exc: BaseException):
-            self._finish_run(None, error=exc)
+            self._finish_run(None, folder=run_folder, error=exc)
 
-        self.app.start_task("organizing", work, on_done=done, on_error=failed)
+        started = self.app.start_task(
+            "organizing", work, on_done=done, on_error=failed
+        )
+        if not started:
+            # Another task holds the engine - restore the pre-click state.
+            self.running = False
+            self.cancel_btn.state(["disabled"])
+            self.progress.grid_forget()
+            self.sort_btn.state(["!disabled"] if preview.ready else ["disabled"])
 
     @staticmethod
     def _sample_lines(preview: engine.PreviewResult, limit: int = 8) -> list[str]:
@@ -414,23 +481,23 @@ class OrganizerPage(Page):
             self.progress.configure(value=done)
         except Exception:
             pass
-        # Mark the row for the file that just moved.
-        source = Path(payload.get("source", ""))
-        for item, op in self._item_ops.items():
-            if op is not None and getattr(op, "source", None) == source:
-                try:
-                    self.tree.set(item, "Status", "Moved ✓")
-                    self.tree.item(item, tags=("moved",))
-                except Exception:
-                    pass
-                break
+        # Mark the row for the file that just moved (O(1) lookup).
+        source = str(payload.get("source", ""))
+        item = self._op_items.get(source)
+        if item is not None:
+            try:
+                self.tree.set(item, "Status", "Moved")
+                self.tree.item(item, tags=("moved",))
+            except Exception:
+                pass
         if total:
             self.summary_var.set(f"Moving {done}/{total} …")
         activity = self.app.pages.get("activity")
         if activity is not None:
             activity.set_progress(done, total)
 
-    def _finish_run(self, summary, error: Optional[BaseException] = None) -> None:
+    def _finish_run(self, summary, folder=None,
+                    error: Optional[BaseException] = None) -> None:
         self.running = False
         self.sort_btn.state(["!disabled"] if self.preview else ["disabled"])
         self.cancel_btn.state(["disabled"])
@@ -444,13 +511,21 @@ class OrganizerPage(Page):
             self.app.log({"type": "error", "message": f"Sorting failed: {error}"})
             return
 
-        # Mark failures in the table.
-        failed_sources = {r.operation.source for r in summary.failures}
-        for item, op in self._item_ops.items():
-            if op is not None and op.source in failed_sources:
+        # Mark failures and skipped duplicates in the table (O(1) lookups).
+        for result in summary.failures:
+            item = self._op_items.get(str(result.operation.source))
+            if item is not None:
                 try:
                     self.tree.set(item, "Status", "Failed")
                     self.tree.item(item, tags=("failed",))
+                except Exception:
+                    pass
+        for op in summary.skipped_duplicates:
+            item = self._op_items.get(str(op.source))
+            if item is not None:
+                try:
+                    self.tree.set(item, "Status", "Skipped (duplicate)")
+                    self.tree.item(item, tags=("skipped",))
                 except Exception:
                     pass
 
@@ -472,7 +547,7 @@ class OrganizerPage(Page):
             "type": "moved" if not summary.failed else "failed",
             "message": (
                 f"Sorted {summary.moved} file(s) into "
-                f"{short_path(str(self.preview.folder), 40)}"
+                f"{short_path(str(folder or self.app.folder or ''), 40)}"
                 + (f" - {summary.failed} failed" if summary.failed else "")
             ),
         })
@@ -531,6 +606,7 @@ class OrganizerPage(Page):
                 on_event=emit,
                 stop_event=stop,
                 record_history=True,
+                echo=False,  # GUI: never write to stdout (windowed EXE)
             )
             return folder
 
@@ -580,7 +656,7 @@ class OrganizerPage(Page):
         cfg = self.app.config
         self.recursive_var.set(bool(cfg.get("recursive", False)))
         self.hidden_var.set(not bool(cfg.get("skip_hidden", True)))
-        self._partial_var().set(bool(cfg.get("skip_partial_downloads", True)))
+        self.partial_var.set(not bool(cfg.get("skip_partial_downloads", True)))
 
     def on_show(self) -> None:
         if self.app.folder and not self.folder_var.get().strip():

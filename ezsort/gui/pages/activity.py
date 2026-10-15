@@ -41,6 +41,7 @@ class ActivityPage(Page):
         self.counts = {"moved": 0, "failed": 0, "skipped": 0, "error": 0}
         self._autoscroll = True
         self._build()
+        self._poll_cancel_state()
 
     # ------------------------------------------------------------------
 
@@ -49,6 +50,9 @@ class ActivityPage(Page):
 
         body = self.body
         body.columnconfigure(0, weight=1)
+        # Page.__init__ weights body row 0 (the chip row here). Only the
+        # event log may flex - the chips must keep their natural height.
+        body.rowconfigure(0, weight=0)
         body.rowconfigure(2, weight=1)
 
         # Chips + controls
@@ -76,6 +80,7 @@ class ActivityPage(Page):
             command=self.app.cancel_current,
         )
         self.cancel_btn.pack(side="right")
+        self.cancel_btn.state(["disabled"])
 
         self.autoscroll_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -138,11 +143,8 @@ class ActivityPage(Page):
 
     def append_entry(self, entry: dict) -> None:
         kind = entry.get("type", "info")
-        if kind in ("moved", "failed", "skipped", "error"):
-            key = kind
-            self.counts[key if key in self.counts else "errors"] = (
-                self.counts.get(key, 0) + 1
-            )
+        if kind in self.counts:
+            self.counts[kind] += 1
             self._sync_chips()
         self._append_line(entry)
 
@@ -198,6 +200,23 @@ class ActivityPage(Page):
             self.progress_frame.grid_remove()
         except Exception:
             pass
+
+    def _poll_cancel_state(self) -> None:
+        """Keep the cancel button honest: enabled only while organizing runs."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            cancellable = self.app.cancel_token_for("organizing") is not None
+            self.cancel_btn.state(["!disabled"] if cancellable else ["disabled"])
+        except Exception:
+            pass
+        try:
+            self.after(700, self._poll_cancel_state)
+        except Exception:
+            pass  # window is going away
 
     # ------------------------------------------------------------------
 

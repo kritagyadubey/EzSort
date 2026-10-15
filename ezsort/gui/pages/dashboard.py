@@ -74,7 +74,7 @@ class DashboardPage(Page):
             ("scanned", "Files scanned"),
             ("ready", "Ready to organize"),
             ("categories", "Categories found"),
-            ("last_run", "Files last organized"),
+            ("last_run", "Files organized (all time)"),
         ]
         for i, (key, caption) in enumerate(captions):
             card = Card(stats_row)
@@ -214,7 +214,14 @@ class DashboardPage(Page):
             self.app.toast(f"Scan failed: {exc}", "error")
             self.app.log({"type": "error", "message": f"Scan failed: {exc}"})
 
-        self.app.start_task("scanning", work, on_done=done, on_error=failed)
+        if not self.app.start_task(
+            "scanning", work, on_done=done, on_error=failed
+        ):
+            # Engine busy - undo the optimistic "Scanning …" text.
+            self.preview_btn.state(["!disabled"])
+            self.folder_summary.configure(
+                text="Another operation is running - try again shortly."
+            )
 
     def _render(self, preview: engine.PreviewResult) -> None:
         folder = preview.folder

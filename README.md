@@ -56,19 +56,24 @@ No files deleted. No files overwritten. Just organized.
 
 ---
 
-## Desktop App (v0.2.0)
+## Desktop App (v0.3.0)
 
-EzSort now ships with a premium dark-theme desktop app — same engine,
-same safety guarantees, zero extra runtime dependencies (it uses the
-Tkinter that already comes with Python).
+EzSort ships with a premium desktop app — same engine, same safety
+guarantees, zero extra runtime dependencies (it uses the Tkinter that
+already comes with Python). Dark theme by default, with a full light
+theme; both are contrast-checked to WCAG AA.
 
 ![Organizer preview](docs/screenshots/organizer-preview.png)
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
+![Light theme](docs/screenshots/dashboard-light.png)
+
 ![Settings](docs/screenshots/settings.png)
 
 ![History](docs/screenshots/history.png)
+
+![Activity](docs/screenshots/activity.png)
 
 **Features**
 
@@ -76,10 +81,18 @@ Tkinter that already comes with Python).
 - **Organizer** — preview every planned move in a table, then execute with one click; cancellable mid-sort
 - **Categories** — browse built-in categories and add/edit/delete custom rules
 - **History** — list past sorts, inspect the files in each, and undo any batch (conflict-safe)
-- **Activity** — live event log of everything EzSort has done
+- **Activity** — live event log of everything EzSort did, this session and last
 - **Settings** — dark/light theme, duplicate strategy, watch interval, and more; changes save instantly
 
 Every button does real work — previews are the same plan the CLI would execute.
+
+**Keyboard shortcuts**
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+1` … `Ctrl+6` | Jump to a page |
+| `F5` | Refresh the current page |
+| `Enter` | Run a preview from the folder box |
 
 **Launch it**
 
@@ -253,9 +266,12 @@ It skips hidden files, symlinks, and its own working directories.
 
 Create a config file to add your own classification rules:
 
-- **Windows:** `%APPDATA%/EzSort/config.json`
+- **Windows:** `%APPDATA%\ezsort\config.json`
 - **Linux:** `~/.config/ezsort/config.json`
 - **macOS:** `~/Library/Application Support/ezsort/config.json`
+
+(Handy shortcut: the app's **Settings** page has an *Open config file*
+button that jumps straight to it.)
 
 Example:
 
@@ -359,6 +375,17 @@ pip install -e ".[dev]"
 pytest
 ```
 
+**Tests**
+
+```bash
+pytest                       # full suite
+pytest tests/test_gui.py     # desktop-app tests (auto-skip if Tk is missing)
+python scripts/gui_smoke.py  # drives the real GUI end to end + screenshots
+```
+
+The suite runs every test against a throwaway `EZSORT_HOME`, so nothing
+can ever read or overwrite your real configuration or history.
+
 **Building the Windows executables**
 
 ```bash
@@ -367,8 +394,22 @@ pyinstaller packaging/ezsort-gui.spec --noconfirm         # -> dist/EzSort/EzSor
 pyinstaller packaging/ezsort-cli.spec --noconfirm         # -> dist/ezsort-cli/ezsort.exe
 ```
 
-CI builds both automatically on every push to `main`, and attaches them
-to a GitHub Release whenever a `v*` tag is pushed.
+The executables embed real Windows version metadata (Product name,
+version and author) and the app icon, so Explorer's Properties dialog
+and the taskbar show them correctly.
+
+**Verifying the built executables**
+
+```bash
+python scripts/verify_cli_exe.py   # end-to-end CLI run on a temp folder
+python scripts/verify_gui_exe.py   # launches the real EXE, screenshots it
+```
+
+Both scripts work only on disposable `%TEMP%` directories — never on your
+own files — and exit non-zero if anything fails.
+
+CI builds both executables automatically on every push to `main`, and
+attaches them to a GitHub Release whenever a `v*` tag is pushed.
 
 ---
 

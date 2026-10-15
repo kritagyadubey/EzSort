@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ezsort import engine
 from ezsort.gui.pages import Page
-from ezsort.gui.theme import short_path
+from ezsort.gui.theme import configure_tree_tags, row_tag, short_path
 from ezsort.gui.widgets import Card, ToolTip, clear_tree, set_tree_columns
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -25,6 +25,9 @@ class HistoryPage(Page):
             "without overwriting anything.",
         )
         self.batches: list[dict] = []
+        #: Operations of the batch currently shown in the detail table,
+        #: indexed by the tree row ids ("0", "1", ...).
+        self._detail_ops: list[dict] = []
         self._refresh_job: Optional[str] = None
         self._build()
 
@@ -37,6 +40,10 @@ class HistoryPage(Page):
 
         body = self.body
         body.columnconfigure(0, weight=1)
+        # Page.__init__ weights body row 0 (the toolbar here). That would
+        # let the toolbar swallow extra height and be squashed in a short
+        # window; only the detail table may flex.
+        body.rowconfigure(0, weight=0)
         body.rowconfigure(2, weight=1)
 
         # Toolbar
@@ -81,6 +88,7 @@ class HistoryPage(Page):
             ("Moved", 70, "e"),
             ("Failed", 70, "e"),
         ])
+        configure_tree_tags(self.batch_tree, self.app.palette)
         bsb = ttk.Scrollbar(list_wrap, orient="vertical",
                             command=self.batch_tree.yview, style="Vertical.TScrollbar")
         self.batch_tree.configure(yscrollcommand=bsb.set)
@@ -109,7 +117,7 @@ class HistoryPage(Page):
             ("Original location", 320, "w"),
             ("Status", 170, "w"),
         ])
-        self.detail_tree.tag_configure("failed", foreground=self.app.palette["danger"])
+        configure_tree_tags(self.detail_tree, self.app.palette)
         dsb = ttk.Scrollbar(detail_wrap, orient="vertical",
                             command=self.detail_tree.yview, style="Vertical.TScrollbar")
         self.detail_tree.configure(yscrollcommand=dsb.set)
@@ -132,17 +140,21 @@ class HistoryPage(Page):
     def refresh(self) -> None:
         self.batches = engine.load_history()
         clear_tree(self.batch_tree)
-        for batch in self.batches:
+        for index, batch in enumerate(self.batches):
             when = str(batch.get("timestamp", ""))[:19].replace("T", " ")
             folder = batch.get("folder", "")
+            failed = int(batch.get("total_failed", 0) or 0)
             self.batch_tree.insert(
-                "", "end",
+                "", "end", iid=str(index),
                 values=(
                     batch.get("batch_id", "?"),
                     when,
                     short_path(folder, 42) if folder else "—",
                     batch.get("total_moved", 0),
-                    batch.get("total_failed", 0) or "",
+                    failed or "",
+                ),
+                tags=(
+                    (*row_tag(index), "failed") if failed else row_tag(index)
                 ),
             )
         stats = engine.stats()
@@ -151,6 +163,7 @@ class HistoryPage(Page):
             f"{stats['total_moved']} file(s) organized"
         )
         clear_tree(self.detail_tree)
+        self._detail_ops = []
         self.undo_selected_btn.state(["disabled"])
         self.delete_btn.state(["disabled"])
         self.detail_var.set("Select an operation to see its files.")
@@ -190,19 +203,20 @@ class HistoryPage(Page):
         clear_tree(self.detail_tree)
         if not batch:
             return
-        for op in batch.get("operations", []):
+        for index, op in enumerate(batch.get("operations", [])):
             failed = op.get("status") == "failed"
             status = f"Failed: {op.get('error', '')}" if failed else "Moved"
             self.detail_tree.insert(
-                "", "end",
+                "", "end", iid=str(index),
                 values=(
                     Path(op.get("source", "")).name,
                     op.get("category", ""),
                     short_path(str(op.get("source", "")), 46),
                     status[:60],
                 ),
-                tags=("failed",) if failed else (),
+                tags=(*row_tag(index), "failed") if failed else row_tag(index),
             )
+        self._detail_ops = batch.get("operations", [])
         when = str(batch.get("timestamp", ""))[:19].replace("T", " ")
         self.detail_var.set(
             f"Operation {batch.get('batch_id')} at {when} - "
@@ -216,24 +230,19 @@ class HistoryPage(Page):
         selection = self.detail_tree.selection()
         if not selection:
             return
-        # Show full paths of the selected file operation.
-        values = self.detail_tree.item(selection[0], "values")
-        batch_id = self._selected_batch_id()
-        if not batch_id or len(values) < 3:
+        # Map the selected row straight to its operation. Row ids are the
+        # operation indices, so duplicate filenames resolve correctly and
+        # no re-reading of the history file is needed.
+        try:
+            op = self._detail_ops[int(selection[0])]
+        except (ValueError, IndexError):
             return
-        batch = engine.load_batch(batch_id)
-        if not batch:
-            return
-        name = values[0]
-        for op in batch.get("operations", []):
-            if Path(op.get("source", "")).name == name:
-                self.detail_var.set(
-                    f"From: {op.get('destination')}\n"
-                    f"Back to: {op.get('source')}\n"
-                    f"Reason: {op.get('reason', '')}"
-                    + (f"\nError: {op.get('error')}" if op.get("error") else "")
-                )
-                break
+        self.detail_var.set(
+            f"From: {op.get('destination')}\n"
+            f"Back to: {op.get('source')}\n"
+            f"Reason: {op.get('reason', '')}"
+            + (f"\nError: {op.get('error')}" if op.get("error") else "")
+        )
 
     # ------------------------------------------------------------------
     # Actions
@@ -330,5 +339,6 @@ class HistoryPage(Page):
         self.refresh()
 
     def apply_theme(self) -> None:
-        self.detail_tree.tag_configure("failed", foreground=self.app.palette["danger"])
+        configure_tree_tags(self.batch_tree, self.app.palette)
+        configure_tree_tags(self.detail_tree, self.app.palette)
         super().apply_theme()

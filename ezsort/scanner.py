@@ -25,10 +25,12 @@ class ScanResult:
     dirs_skipped: int = 0
 
 
-def _excluded(name: str, excluded_dirs: list[str]) -> bool:
-    """Case-insensitive directory-name check (Windows folders are too)."""
-    lowered = {d.lower() for d in excluded_dirs}
-    return name.lower() in lowered
+def _excluded(name: str, excluded_dirs: set[str]) -> bool:
+    """Case-insensitive directory-name check (Windows folders are too).
+
+    *excluded_dirs* must already be lowercased (computed once per scan).
+    """
+    return name.lower() in excluded_dirs
 
 
 def scan_directory_ex(
@@ -55,6 +57,9 @@ def scan_directory_ex(
     if not directory.is_dir():
         result.errors.append(f"Not a directory: {directory}")
         return result
+
+    # Lowercased once: the check runs for every directory we meet.
+    excluded_lower = {d.lower() for d in excluded_dirs}
 
     # Iterative traversal: no recursion limit issues on very deep trees.
     pending: list[Path] = [directory]
@@ -84,7 +89,7 @@ def scan_directory_ex(
                     continue
 
                 if entry.is_dir(follow_symlinks=False):
-                    if _excluded(entry.name, excluded_dirs):
+                    if _excluded(entry.name, excluded_lower):
                         result.dirs_skipped += 1
                         logger.debug("Skipping excluded directory: %s", entry.name)
                         continue

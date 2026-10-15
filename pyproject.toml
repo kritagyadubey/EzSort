@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ezsort"
-version = "0.2.0"
+version = "0.3.0"
 description = "A safe, lightweight file organizer with a CLI and a premium desktop GUI that tidies folders into categories."
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Utilities",
 ]
 dependencies = []

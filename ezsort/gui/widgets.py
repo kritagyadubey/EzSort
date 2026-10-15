@@ -119,7 +119,11 @@ class ScrollableFrame(ttk.Frame):
 
 
 class ToolTip:
-    """Simple hover tooltip for widgets with truncated text."""
+    """Simple hover tooltip for widgets with truncated text.
+
+    Colors follow the active theme (see ``ezsort.gui.theme``), so
+    tooltips stay readable in both dark and light mode.
+    """
 
     def __init__(self, widget, text: Callable[[], str] | str, delay: int = 350):
         self.widget = widget
@@ -152,6 +156,9 @@ class ToolTip:
         if not content:
             return
         self._hide()
+        from ezsort.gui.theme import active_palette
+
+        p = active_palette()
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
         tip.attributes("-topmost", True)
@@ -159,10 +166,10 @@ class ToolTip:
             tip,
             text=content,
             justify="left",
-            background="#1c2230",
-            foreground="#e6edf3",
-            relief="solid",
-            borderwidth=1,
+            background=p.get("tooltip_bg", "#1c2230"),
+            foreground=p.get("tooltip_fg", "#e6edf3"),
+            highlightthickness=1,
+            highlightbackground=p.get("tooltip_border", "#3a4354"),
             padx=8,
             pady=5,
             font=("Segoe UI", 9),

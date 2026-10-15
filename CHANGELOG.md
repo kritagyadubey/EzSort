@@ -4,6 +4,82 @@ All notable changes to EzSort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-10-15
+
+A stability-and-polish release. No new commands; the focus was making
+every existing path correct, and making the desktop app feel finished.
+
+### Fixed
+
+- **Every GUI sort failed.** `organizer.sort_files()` passed a
+  `cancel_check` name that no longer existed after the per-task cancel
+  token refactor, so *every* run ended with "Sorting failed: name
+  'cancel_check' is not defined" without moving a file. The cancel
+  callback is now defined inside the worker and wired to the token that
+  run actually owns.
+- **Stale previews could sort the wrong folder.** Picking a new folder
+  while a scan of the previous one was still running let the old result
+  land afterwards, so the table showed a plan for a folder the user had
+  already left. Scans now carry a sequence number and superseded results
+  are dropped; changing folder or options invalidates in-flight scans.
+- **"Sort unfinished downloads too" was inverted.** The checkbox wrote
+  the opposite of what it offered, so ticking it *stopped* partial
+  downloads being sorted and unticking them let half-finished
+  `.crdownload`/`.part` files be moved mid-download.
+- **Cancel could hit the wrong task.** A single shared cancel token meant
+  the Organizer's Cancel button could cancel watch mode (and vice versa).
+  Tokens are now per-task, keyed by label.
+- **Busy indicator lied.** It reported "Idle" while watch mode or another
+  task was still running; it now reflects whatever is actually alive.
+- **Light theme leaks.** The sidebar brand block and its separators are
+  plain Tk widgets, so a theme switch left them in the old palette — a
+  black block in light mode. They are now recolored explicitly.
+- **Clipped summary line.** `Page.__init__` gives the body's first row
+  `weight=1`, so in a short window grid shrank the Organizer's options
+  card and cut the "N file(s) scanned | N move(s) planned" summary in
+  half. Only the scrollable table row flexes now (Organizer, History and
+  Activity).
+- **History details mismatched duplicate filenames.** Selecting a row in
+  the batch detail table resolved files by name, so two files with the
+  same name showed the wrong one. Rows are now keyed by operation index.
+- **Frozen EXE lost its icon.** The build bundles it into `packaging/`
+  inside the bundle, but the runtime lookup only checked the bundle root.
+- **Misleading stat label.** The dashboard's "Files last organized" now
+  reads "Files organized (all time)", matching the cumulative number it
+  actually displays.
+- Watch-mode history was written once per moved file (one full file
+  rewrite each); a wave of downloads is now recorded as a single
+  undoable batch, flushed on a quiet poll and on exit.
+- Watch mode no longer writes to stdout when driven by the GUI (a
+  windowed EXE has no console); the CLI keeps its full output.
+
+### Changed
+
+- Dark and light palettes were rebuilt for legibility; both now clear
+  WCAG AA (4.5:1) for body text, muted text, the accent button label and
+  the status colors used in tables.
+- Visible keyboard focus on entries, comboboxes and buttons, plus
+  `Ctrl+1..6` page navigation and `F5` refresh.
+- Tables use striped rows and consistent moved/failed/skipped/rename
+  colors across every page.
+- Per-Monitor V2 DPI awareness, so the window is crisp on mixed-scale
+  displays.
+- The real app icon is used for the window and taskbar (source and
+  frozen builds); executables embed Windows version metadata, so
+  Explorer's Properties shows the product name, version and author.
+- Organizer progress updates use a source-path lookup instead of
+  rescanning the table per file.
+
+### Added
+
+- Desktop-app tests (`tests/test_gui.py`) covering palettes, contrast,
+  theming, navigation, per-task cancellation, and end-to-end preview /
+  sort / cancel runs. They build the real Tk app and skip cleanly when Tk
+  is unavailable.
+- Watch-mode batching tests, and regression tests for each fix above.
+- `scripts/verify_cli_exe.py` and `scripts/verify_gui_exe.py`: end-to-end
+  checks of the *built* executables on disposable temp folders.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

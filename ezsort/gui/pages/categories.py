@@ -8,6 +8,7 @@ from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
 from ezsort.gui.pages import Page
+from ezsort.gui.theme import configure_tree_tags, row_tag
 from ezsort.gui.widgets import Card, ToolTip, clear_tree, set_tree_columns
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -70,10 +71,8 @@ class CategoriesPage(Page):
         self.cat_tree.configure(yscrollcommand=sb.set)
         self.cat_tree.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
-        self.cat_tree.bind(
-            "<<TreeviewSelect>>",
-            lambda e: self._cat_tooltip(),
-        )
+        configure_tree_tags(self.cat_tree)
+        # The tooltip pulls its text lazily, so it stays correct after reloads.
         self._cat_tip = ToolTip(self.cat_tree, lambda: self._cat_full_text())
 
         # ---- custom rules ----------------------------------------------
@@ -99,6 +98,7 @@ class CategoriesPage(Page):
         self.rule_tree.grid(row=0, column=0, sticky="nsew")
         rsb.grid(row=0, column=1, sticky="ns")
         self.rule_tree.bind("<<TreeviewSelect>>", self._on_rule_select)
+        configure_tree_tags(self.rule_tree)
 
         # reorder / remove buttons
         actions = ttk.Frame(rule_card, style="Surface.TFrame")
@@ -177,10 +177,10 @@ class CategoriesPage(Page):
 
         order = [c for c in CATEGORY_ORDER if c in categories]
         order += [c for c in categories if c not in order]
-        for name in order:
+        for i, name in enumerate(order):
             exts = categories[name] or []
             preview = ", ".join(exts[:12]) + (" …" if len(exts) > 12 else "")
-            self.cat_tree.insert("", "end", values=(name, preview))
+            self.cat_tree.insert("", "end", values=(name, preview), tags=(row_tag(i),))
 
     def _cat_full_text(self) -> str:
         selection = self.cat_tree.selection()
@@ -189,9 +189,6 @@ class CategoriesPage(Page):
         name = self.cat_tree.item(selection[0], "values")[0]
         exts = self.app.config.get("categories", {}).get(name, [])
         return f"{name} ({len(exts)} extensions):\n" + "  ".join(exts)
-
-    def _cat_tooltip(self) -> None:
-        pass  # ToolTip pulls text lazily via _cat_full_text
 
     # ------------------------------------------------------------------
     # Rule editing
@@ -212,6 +209,7 @@ class CategoriesPage(Page):
             self.rule_tree.insert(
                 "", "end", iid=str(i),
                 values=(rule.get("pattern", ""), label, dest),
+                tags=(row_tag(i),),
             )
         self.selected_index = None
         self.update_btn.state(["disabled"])

@@ -35,26 +35,39 @@ def _run_watch(folder: Path, recursive: bool = False,
     return thread, stop, events
 
 
+def _wait_for(predicate, timeout: float = 30.0) -> bool:
+    """Poll ``predicate`` until true or ``timeout``. Never raises.
+
+    Deliberately non-raising: every test here stops the watcher and joins it
+    *before* judging the result. That matters on CI, where antivirus can hold
+    a rename for tens of seconds - the move is still correct, just slow - and
+    because a watcher thread left running after ``join`` would flush its
+    history into the *next* test's ``EZSORT_HOME``.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def test_watch_moves_new_stable_file(tmp_path):
     folder = tmp_path / "watched"
     folder.mkdir()
     thread, stop, events = _run_watch(folder)
+    target = folder / "Documents" / "arrived.pdf"
     try:
         time.sleep(1.4)  # let it settle with only pre-existing content
-        new_file = folder / "arrived.pdf"
-        new_file.write_bytes(b"pdf")
-
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if (folder / "Documents" / "arrived.pdf").exists():
-                break
-            time.sleep(0.2)
-        assert (folder / "Documents" / "arrived.pdf").exists(), (
-            f"watch did not move the file; events={[e.get('message') for e in events]}"
-        )
+        (folder / "arrived.pdf").write_bytes(b"pdf")
+        _wait_for(lambda: target.exists())
     finally:
         stop.set()
-        thread.join(timeout=5)
+        thread.join(timeout=30)
+
+    assert target.exists(), (
+        f"watch did not move the file; events={[e.get('message') for e in events]}"
+    )
     assert not thread.is_alive()
 
 
@@ -70,31 +83,29 @@ def test_watch_ignores_preexisting_files(tmp_path):
         assert not (folder / "Documents").exists()
     finally:
         stop.set()
-        thread.join(timeout=5)
+        thread.join(timeout=30)
 
 
 def test_watch_records_history(tmp_path):
     folder = tmp_path / "watched"
     folder.mkdir()
     thread, stop, events = _run_watch(folder)
+    target = folder / "Music" / "new-song.mp3"
     try:
         time.sleep(1.2)
         (folder / "new-song.mp3").write_bytes(b"mp3")
-        # Wait for the file itself (the same pattern the first test uses),
-        # and give it room: this assertion failed on CI when a loaded
-        # runner pushed the move past the old 6s budget, so the wait has to
-        # tolerate a slow machine rather than assume one.
-        target = folder / "Music" / "new-song.mp3"
-        deadline = time.time() + 15
-        while time.time() < deadline and not target.exists():
-            time.sleep(0.2)
-        assert target.exists(), (
-            f"watch did not move the file; events="
-            f"{[e.get('message') for e in events]}"
-        )
+        _wait_for(lambda: target.exists())
     finally:
         stop.set()
-        thread.join(timeout=5)
+        # Joining before judging is what keeps a merely-slow move (and the
+        # thread performing it) inside *this* test: a short join used to let
+        # the thread survive into the next test and record its batch there.
+        thread.join(timeout=30)
+
+    assert target.exists(), (
+        f"watch did not move the file; events={[e.get('message') for e in events]}"
+    )
+    assert not thread.is_alive()
 
     history = get_history()
     assert history, "watch-mode move was not recorded in history"
@@ -117,7 +128,7 @@ def test_watch_skips_partial_downloads(tmp_path):
         assert not (folder / "Documents").exists()
     finally:
         stop.set()
-        thread.join(timeout=5)
+        thread.join(timeout=30)
 
 
 def test_watch_event_callback_receives_messages(tmp_path):
@@ -125,23 +136,19 @@ def test_watch_event_callback_receives_messages(tmp_path):
     folder.mkdir()
     received: list[dict] = []
     thread, stop, _ = _run_watch(folder, on_event=received.append)
+    target = folder / "Documents" / "notes.txt"
     try:
         time.sleep(1.2)
         (folder / "notes.txt").write_bytes(b"txt")
-        # Wait for the file itself rather than an intermediate state, and
-        # allow enough time for a slow runner (see the note in the test
-        # above: a 6s budget failed on CI).
-        target = folder / "Documents" / "notes.txt"
-        deadline = time.time() + 15
-        while time.time() < deadline and not target.exists():
-            time.sleep(0.2)
-        assert target.exists(), (
-            f"watch did not move the file; events="
-            f"{[e.get('message') for e in received]}"
-        )
+        _wait_for(lambda: target.exists())
     finally:
         stop.set()
-        thread.join(timeout=5)
+        thread.join(timeout=30)
+
+    assert target.exists(), (
+        f"watch did not move the file; events={[e.get('message') for e in received]}"
+    )
+    assert not thread.is_alive()
 
     kinds = [e.get("type") for e in received]
     assert "info" in kinds

@@ -32,3 +32,7 @@ htmlcov/
 
 # EzSort
 *.log
+
+# Release archives (built by scripts / CI, never committed)
+EzSort-gui-windows.zip
+ezsort-cli-windows.zip

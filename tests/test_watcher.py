@@ -44,7 +44,7 @@ def test_watch_moves_new_stable_file(tmp_path):
         new_file = folder / "arrived.pdf"
         new_file.write_bytes(b"pdf")
 
-        deadline = time.time() + 6
+        deadline = time.time() + 15
         while time.time() < deadline:
             if (folder / "Documents" / "arrived.pdf").exists():
                 break
@@ -80,10 +80,18 @@ def test_watch_records_history(tmp_path):
     try:
         time.sleep(1.2)
         (folder / "new-song.mp3").write_bytes(b"mp3")
-        deadline = time.time() + 6
-        while time.time() < deadline and not (folder / "Music").exists():
+        # Wait for the file itself (the same pattern the first test uses),
+        # and give it room: this assertion failed on CI when a loaded
+        # runner pushed the move past the old 6s budget, so the wait has to
+        # tolerate a slow machine rather than assume one.
+        target = folder / "Music" / "new-song.mp3"
+        deadline = time.time() + 15
+        while time.time() < deadline and not target.exists():
             time.sleep(0.2)
-        assert (folder / "Music" / "new-song.mp3").exists()
+        assert target.exists(), (
+            f"watch did not move the file; events="
+            f"{[e.get('message') for e in events]}"
+        )
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -120,10 +128,17 @@ def test_watch_event_callback_receives_messages(tmp_path):
     try:
         time.sleep(1.2)
         (folder / "notes.txt").write_bytes(b"txt")
-        deadline = time.time() + 6
-        while time.time() < deadline and not (folder / "Documents").exists():
+        # Wait for the file itself rather than an intermediate state, and
+        # allow enough time for a slow runner (see the note in the test
+        # above: a 6s budget failed on CI).
+        target = folder / "Documents" / "notes.txt"
+        deadline = time.time() + 15
+        while time.time() < deadline and not target.exists():
             time.sleep(0.2)
-        assert (folder / "Documents" / "notes.txt").exists()
+        assert target.exists(), (
+            f"watch did not move the file; events="
+            f"{[e.get('message') for e in received]}"
+        )
     finally:
         stop.set()
         thread.join(timeout=5)

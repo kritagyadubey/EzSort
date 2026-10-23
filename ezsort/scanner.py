@@ -98,7 +98,13 @@ def scan_directory_ex(
                     continue
 
                 if entry.is_file(follow_symlinks=False):
-                    result.files.append(FileItem(path=Path(entry.path)))
+                    info = entry.stat(follow_symlinks=False)
+                    result.files.append(FileItem(
+                        path=Path(entry.path),
+                        size=info.st_size,
+                        extension=Path(entry.name).suffix.lower(),
+                        probed=True,
+                    ))
                     logger.debug("Found file: %s", entry.name)
             except OSError as e:
                 result.errors.append(f"Cannot stat {entry.path}: {e}")

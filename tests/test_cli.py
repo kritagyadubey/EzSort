@@ -133,3 +133,65 @@ def test_cli_organize_idempotent(cli_dir):
     main(["organize", str(cli_dir), "--yes"])
     result = main(["organize", str(cli_dir), "--yes", "--dry-run"])
     assert result == 0
+
+
+#: A folder that exercises moves, category folders, hidden files and a
+#: partial download, so the comparison covers both "moved" and "skipped".
+GOLDEN_FILES = {
+    "photo.jpg": b"jpeg",
+    "holiday.png": b"png",
+    "report.pdf": b"pdf",
+    "notes.txt": b"text",
+    "song.mp3": b"audio",
+    "movie.mp4": b"video",
+    "backup.zip": b"zip",
+    "script.py": b"code",
+    "budget.csv": b"csv",
+    "slides.pptx": b"pptx",
+    ".hidden.jpg": b"hidden",
+    "leftover.crdownload": b"partial",
+}
+
+
+def _relative_tree(root):
+    return sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_cli_and_gui_engine_produce_the_same_tree(tmp_path):
+    """CLI golden parity: both front ends execute one identical plan.
+
+    The GUI previews with ``engine.build_preview`` and the CLI parses
+    arguments around the same function. Running each against an identical
+    copy of a synthetic folder must produce byte-for-byte identical trees,
+    including the files both deliberately leave alone.
+    """
+    from ezsort import engine
+    from ezsort.config import load_config
+
+    cli_dir = tmp_path / "cli-downloads"
+    gui_dir = tmp_path / "gui-downloads"
+    for folder in (cli_dir, gui_dir):
+        folder.mkdir()
+        for name, content in GOLDEN_FILES.items():
+            (folder / name).write_bytes(content)
+
+    config = load_config()
+    preview = engine.build_preview(gui_dir, config=config, recursive=False)
+    engine.run_plan(preview, config=config)
+
+    assert main(["organize", str(cli_dir), "--yes"]) == 0
+
+    gui_tree = _relative_tree(gui_dir)
+    assert gui_tree == _relative_tree(cli_dir), (
+        "the CLI and the GUI engine disagree about where files belong"
+    )
+    # The shared plan is real, not two empty trees.
+    assert "Images/photo.jpg" in gui_tree
+    assert "Documents/report.pdf" in gui_tree
+    assert "Music/song.mp3" in gui_tree
+    assert ".hidden.jpg" in gui_tree, "hidden files must stay put"
+    assert "leftover.crdownload" in gui_tree, "partials must stay put"

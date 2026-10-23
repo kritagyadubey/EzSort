@@ -23,8 +23,13 @@ class FileItem:
     extension: str = ""
     is_symlink: bool = False
     is_dir: bool = False
+    #: True when the caller already filled every field from a DirEntry.
+    #: Skips four filesystem probes per file during large scans.
+    probed: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.probed:
+            return
         try:
             exists = self.path.exists()
         except OSError:

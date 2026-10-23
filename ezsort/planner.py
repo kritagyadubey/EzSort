@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ezsort.models import FileItem, Operation
-from ezsort.utils import is_within_directory, path_exists, sanitize_relative_path
+from ezsort.utils import path_exists, sanitize_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -23,28 +24,52 @@ class PlanResult:
 
 def _category_destination(
     target_directory: Path,
-    category: str,
+    parts: list[str],
     filename: str,
 ) -> Path | None:
     """Build a safe destination path, or None if the category is unusable.
 
-    Every category segment is sanitized, so a hostile or broken custom rule
-    such as ``../../Windows`` can never place files outside the target
-    folder.
+    ``parts`` are already-sanitized category segments, so they cannot
+    contain separators or traversal. The containment check is a plain
+    normalized string comparison - no filesystem calls - because the
+    planner resolves the target once.
     """
-    clean = sanitize_relative_path(category)
-    parts = [p for p in clean.split("/") if p]
     if not parts:
         return None
-    dest = target_directory
-    for part in parts:
-        dest = dest / part
-    dest = dest / filename
-
-    # Defense in depth: the final path must live inside the target folder.
-    if not is_within_directory(target_directory, dest):
+    dest = Path(os.path.join(str(target_directory), *parts, filename))
+    target_norm = os.path.normcase(str(target_directory))
+    dest_norm = os.path.normcase(str(dest))
+    if not (dest_norm == target_norm
+            or dest_norm.startswith(target_norm + os.sep)):
         return None
     return dest
+
+
+def _resolved_source(
+    source: Path,
+    target_abs: str,
+    target_resolved: Path,
+) -> Path:
+    """Resolve a source path without a filesystem round-trip when possible.
+
+    The scanner builds every source from the target folder, so the common
+    case is purely lexical: map the relative part onto the already-resolved
+    target. This keeps planning O(n) instead of calling ``Path.resolve()``
+    several times per file (which made a 10k-file preview take minutes).
+    """
+    source_abs = os.path.abspath(str(source))
+    target_norm = os.path.normcase(target_abs)
+    source_norm = os.path.normcase(source_abs)
+    if source_norm == target_norm:
+        return target_resolved
+    prefix = target_norm + os.sep
+    if source_norm.startswith(prefix):
+        relative = source_abs[len(target_abs) + 1:]
+        return Path(os.path.join(str(target_resolved), relative))
+    try:
+        return source.resolve()
+    except OSError:  # pragma: no cover - extremely rare
+        return source
 
 
 def create_plan_detailed(
@@ -61,11 +86,12 @@ def create_plan_detailed(
       * files whose category cannot be turned into a safe destination.
     """
     result = PlanResult()
-    # Resolve target once for robust comparisons.
+    # Resolve the target once; every source path is derived from it.
     try:
         target_resolved = target_directory.resolve()
     except OSError:  # pragma: no cover - extremely rare
         target_resolved = target_directory
+    target_abs = os.path.abspath(str(target_directory))
 
     for file_item, category, reason in classified_files:
         source = file_item.path
@@ -77,35 +103,33 @@ def create_plan_detailed(
             result.skipped.append((source, "Category name is not usable"))
             continue
 
-        category_root = target_resolved / parts[0]
+        category_root = Path(os.path.join(str(target_resolved), parts[0]))
 
-        # Resolve source once for robust comparisons.
-        try:
-            source_resolved = source.resolve()
-        except OSError:  # pragma: no cover
-            source_resolved = source
+        source_resolved = _resolved_source(
+            source, target_abs, target_resolved,
+        )
 
         # Already inside its own category folder (incl. subfolders)?
         # Keeps recursive runs idempotent: organized files are never
         # shuffled back out or renamed again.
-        if is_within_directory(category_root, source_resolved):
+        source_norm = os.path.normcase(str(source_resolved))
+        root_norm = os.path.normcase(str(category_root))
+        if (source_norm == root_norm
+                or source_norm.startswith(root_norm + os.sep)):
             logger.debug("Skipping %s - already organized", source.name)
             result.skipped.append((source, "Already inside its category folder"))
             continue
 
-        dest_path = _category_destination(target_directory, category, source.name)
+        dest_path = _category_destination(target_resolved, parts, source.name)
         if dest_path is None:
             result.skipped.append((source, f"Unsafe category: {category!r}"))
             continue
 
         # Skip if source and destination are the same file.
-        try:
-            if source.resolve() == dest_path.resolve():
-                logger.debug("Skipping %s - already in correct location", source.name)
-                result.skipped.append((source, "Already in correct location"))
-                continue
-        except OSError:
-            pass
+        if source_norm == os.path.normcase(str(dest_path)):
+            logger.debug("Skipping %s - already in correct location", source.name)
+            result.skipped.append((source, "Already in correct location"))
+            continue
 
         collision = path_exists(dest_path)
         if collision:

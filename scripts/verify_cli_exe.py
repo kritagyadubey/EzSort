@@ -16,6 +16,8 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from ezsort import __version__  # noqa: E402
 
 DEMO_FILES = {
     "photo.jpg": b"jpeg",
@@ -76,7 +78,8 @@ def main() -> int:
         print("-- version --")
         proc = run(exe, ["--version"], home, work)
         check(proc.returncode == 0, f"--version exits 0 (got {proc.returncode})")
-        check("0.3.0" in proc.stdout, f"version string shows 0.3.0: {proc.stdout.strip()!r}")
+        check(__version__ in proc.stdout,
+              f"version string shows {__version__}: {proc.stdout.strip()!r}")
 
         print("\n-- scan (no side effects) --")
         before = sorted(p.name for p in demo.iterdir())

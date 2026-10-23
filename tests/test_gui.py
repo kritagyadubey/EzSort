@@ -14,20 +14,16 @@ import pytest
 
 tk = pytest.importorskip("tkinter", reason="tkinter is not available")
 
-from ezsort.gui import theme  # noqa: E402
+from ezsort.gui import theme, tokens  # noqa: E402
 
 
 # ----------------------------------------------------------------------
 # Pure helpers (no window needed)
 # ----------------------------------------------------------------------
 
-#: Every palette role the pages and widgets rely on.
-REQUIRED_ROLES = [
-    "name", "bg", "surface", "surface_alt", "border", "text", "muted",
-    "accent", "accent_hover", "accent_active", "success", "warning",
-    "danger", "selection", "row_alt", "sidebar", "on_accent",
-    "tooltip_bg", "tooltip_fg", "tooltip_border",
-]
+#: Every palette role the pages and widgets rely on. The design tokens are
+#: the single source of truth; a palette must define exactly these roles.
+REQUIRED_ROLES = list(tokens.COLOR_ROLES)
 
 
 def test_both_palettes_define_every_role():
@@ -74,13 +70,14 @@ def test_body_text_contrast_meets_wcag_aa(palette_name):
 
 
 @pytest.mark.parametrize("palette_name", sorted(theme.PALETTES))
-def test_muted_text_is_readable(palette_name):
-    """Muted text (captions, hints) still needs 4.5:1 against its surface."""
+def test_secondary_text_is_readable(palette_name):
+    """Secondary text (captions, hints) still needs 4.5:1 against surfaces."""
     p = theme.PALETTES[palette_name]
-    assert _contrast(p["muted"], p["surface"]) >= 4.5, (
-        f"{palette_name}: muted-on-surface contrast too low"
+    assert _contrast(p["text_secondary"], p["surface"]) >= 4.5, (
+        f"{palette_name}: secondary-on-surface contrast too low"
     )
-    assert _contrast(p["muted"], p["bg"]) >= 4.5
+    assert _contrast(p["text_secondary"], p["bg"]) >= 4.5
+    assert _contrast(p["text_secondary"], p["sidebar"]) >= 4.5
 
 
 @pytest.mark.parametrize("palette_name", sorted(theme.PALETTES))
@@ -767,3 +764,163 @@ def test_organizer_cancel_stops_a_run_early(app, tmp_path, pinned_config):
 
     history = get_history()
     assert history, "a cancelled run must still record what it moved"
+
+
+# ----------------------------------------------------------------------
+# Filters, scrolling and large folders
+# ----------------------------------------------------------------------
+
+def test_organizer_filter_and_search_narrow_the_table(app, tmp_path,
+                                                      pinned_config):
+    """Filter chips and search must hide rows without losing the plan."""
+    from ezsort import engine
+
+    folder = tmp_path / "filter-downloads"
+    folder.mkdir()
+    (folder / "photo.jpg").write_bytes(b"jpeg")
+    (folder / "report.pdf").write_bytes(b"pdf")
+    (folder / "leftover.crdownload").write_bytes(b"partial")
+
+    organizer = _show(app, "organizer")
+    _wait_until(app, lambda: not app.is_busy(), label="auto-preview settling")
+    pinned_config["skip_partial_downloads"] = True
+    pinned_config["skip_hidden"] = True
+    organizer.sync_options_from_config()
+
+    preview = engine.build_preview(folder, config=app.config, recursive=False)
+    organizer.set_folder(folder)
+    organizer.preview = preview
+    organizer._populate(preview)
+    _pump(app)
+
+    assert len(organizer.tree.get_children()) == 3
+    assert organizer.table_badge is not None
+
+    organizer.filter_var.set("Moves")
+    organizer._apply_filter()
+    assert len(organizer.tree.get_children()) == 2
+    assert "2 of 3" in organizer.table_badge.cget("text")
+
+    organizer.filter_var.set("Skipped")
+    organizer._apply_filter()
+    visible = organizer.tree.get_children()
+    assert len(visible) == 1
+    assert "Skipped" in str(organizer.tree.item(visible[0], "values"))
+
+    organizer.filter_var.set("All rows")
+    organizer.search.set("report")
+    organizer._apply_filter()
+    visible = organizer.tree.get_children()
+    assert len(visible) == 1
+    assert "report.pdf" in str(organizer.tree.item(visible[0], "values"))
+
+    organizer.search.clear()
+    organizer._apply_filter()
+    assert len(organizer.tree.get_children()) == 3
+
+
+def test_activity_filter_and_search_match_entries(app):
+    activity = _show(app, "activity")
+    activity.render_all()
+    activity.append_entry(
+        {"time": "10:00:00", "type": "moved", "message": "Moved 3 files"})
+    activity.append_entry(
+        {"time": "10:00:01", "type": "failed", "message": "Could not move x"})
+    activity.append_entry(
+        {"time": "10:00:02", "type": "info", "message": "Watch mode is idle"})
+
+    activity.filter_var.set("moved")
+    activity._rebuild_text()
+    text = activity.text.get("1.0", "end")
+    assert "Moved 3 files" in text
+    assert "Could not move x" not in text
+    assert "Watch mode is idle" not in text
+
+    activity.filter_var.set("all")
+    activity.search.set("watch")
+    activity._rebuild_text()
+    text = activity.text.get("1.0", "end")
+    assert "Watch mode is idle" in text
+    assert "Moved 3 files" not in text
+
+    activity.search.clear()
+    activity._rebuild_text()
+    text = activity.text.get("1.0", "end")
+    assert "Moved 3 files" in text
+    assert "Watch mode is idle" in text
+
+
+def test_scrollable_frame_updates_its_scroll_region(app):
+    """A page may bind <Configure> on the body without breaking scrolling.
+
+    Regression test: Dashboard's ``_resize_recent`` replaced
+    ScrollableFrame's own body binding (Tkinter replaces unless add="+"),
+    so the scroll region stayed empty and tall content was silently
+    clipped with no way to scroll.
+    """
+    from tkinter import ttk
+
+    from ezsort.gui.components import ScrollableFrame
+
+    win = tk.Toplevel(app.root)
+    try:
+        win.geometry("320x160+0+0")
+        scroll = ScrollableFrame(win, bg_role="bg", auto_hide=True)
+        scroll.pack(fill="both", expand=True)
+        for index in range(60):
+            ttk.Label(scroll.body, text=f"row {index}").pack(anchor="w")
+        # Simulate the Dashboard's own binding (without add="+").
+        scroll.body.bind("<Configure>", lambda _e: None)
+        _pump(app, rounds=10)
+
+        region = str(scroll.canvas.cget("scrollregion"))
+        assert region, "the canvas never received a scroll region"
+        parts = [int(float(v)) for v in region.split()]
+        assert parts[3] > scroll.canvas.winfo_height(), (
+            "60 rows should be taller than the 160px viewport"
+        )
+        assert scroll.scrollbar.winfo_ismapped(), (
+            "the auto-hide scrollbar should be visible for overflowing content"
+        )
+    finally:
+        win.destroy()
+
+
+def test_ten_thousand_files_preview_and_table(app, tmp_path):
+    """A 10k-file folder must plan and render without pathological slowness."""
+    import time
+
+    from ezsort import engine
+
+    folder = tmp_path / "ten-thousand"
+    folder.mkdir()
+    for index in range(10_000):
+        (folder / f"file{index:05d}.pdf").write_bytes(b"pdf")
+
+    started = time.perf_counter()
+    preview = engine.build_preview(folder, config=app.config, recursive=False)
+    preview_seconds = time.perf_counter() - started
+    assert len(preview.operations) == 10_000
+    assert preview_seconds < 30.0, (
+        f"planning 10k files took {preview_seconds:.1f}s"
+    )
+
+    organizer = _show(app, "organizer")
+    _wait_until(app, lambda: not app.is_busy(), label="auto-preview settling")
+    table = organizer.table
+    table.clear()
+    rows = [
+        (f"file{index:05d}.pdf", "Documents", "Documents/file.pdf", "Move")
+        for index in range(10_000)
+    ]
+    started = time.perf_counter()
+    table.insert_batched(rows, batch_size=500)
+    _wait_until(
+        app, lambda: len(table.tree.get_children()) == 10_000,
+        timeout=20.0, label="10k table rows",
+    )
+    table_seconds = time.perf_counter() - started
+    assert table_seconds < 20.0, (
+        f"inserting 10k rows took {table_seconds:.1f}s"
+    )
+    table.clear()

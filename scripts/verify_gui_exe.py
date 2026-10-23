@@ -22,6 +22,9 @@ from ctypes import wintypes
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from ezsort import __version__  # noqa: E402
+
 user32 = ctypes.windll.user32
 DWMWA_CLOAKED = 14
 
@@ -214,7 +217,7 @@ def main() -> int:
 
         title = window_title(hwnd)
         check("EzSort" in title, f"window title is '{title}'")
-        check("0.3.0" in title, "title shows the 0.3.0 version")
+        check(__version__ in title, f"title shows the {__version__} version")
 
         time.sleep(2.5)  # let the dashboard scan settle
         # Raise it first: a screen-grab fallback would otherwise capture

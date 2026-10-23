@@ -6,27 +6,28 @@ import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING
 
-from ezsort.gui.pages import Page
-from ezsort.gui.widgets import Card, ToolTip
+from ezsort.activity import clear_activity
+from ezsort.gui import theme
+from ezsort.gui.components import (
+    Card,
+    ConfirmDialog,
+    SearchBox,
+    SegmentedControl,
+    ToolTip,
+)
+from ezsort.gui.pages import Page, sp
 
 if TYPE_CHECKING:  # pragma: no cover
     from ezsort.gui.app import EzSortApp
 
-TAG_COLORS = {
-    "info": "#9aa4b2",
-    "moved": "#3fb950",
-    "failed": "#f85149",
-    "error": "#f85149",
-    "skipped": "#d29922",
-    "undone": "#58a6ff",
-}
-LIGHT_COLORS = {
-    "info": "#5f6b7d",
-    "moved": "#1a7f37",
-    "failed": "#cf222e",
-    "error": "#cf222e",
-    "skipped": "#9a6700",
-    "undone": "#0969da",
+KIND_ROLE = {
+    "info": "text_secondary",
+    "moved": "success",
+    "failed": "danger",
+    "error": "danger",
+    "skipped": "warning",
+    "cancelled": "warning",
+    "undone": "info",
 }
 
 
@@ -39,6 +40,7 @@ class ActivityPage(Page):
             "including anything that went wrong.",
         )
         self.counts = {"moved": 0, "failed": 0, "skipped": 0, "error": 0}
+        self._entries: list[dict] = []
         self._autoscroll = True
         self._build()
         self._poll_cancel_state()
@@ -46,98 +48,132 @@ class ActivityPage(Page):
     # ------------------------------------------------------------------
 
     def _build(self) -> None:
-        self.header.action_button("Clear view", self.clear_view)
+        self.header.secondary("Copy log", self.copy_log, style="Ghost.TButton")
+        self.header.secondary("Clear log", self.clear_view,
+                              style="Ghost.TButton")
 
         body = self.body
         body.columnconfigure(0, weight=1)
-        # Page.__init__ weights body row 0 (the chip row here). Only the
-        # event log may flex - the chips must keep their natural height.
+        # Only the event log may flex - the chips keep their natural height.
         body.rowconfigure(0, weight=0)
+        body.rowconfigure(1, weight=0)
         body.rowconfigure(2, weight=1)
 
-        # Chips + controls
         top = ttk.Frame(body, style="TFrame")
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top.grid(row=0, column=0, sticky="ew", pady=(0, sp("sm")))
+        top.columnconfigure(0, weight=1)
 
-        self.chip_vars = {}
-        for key, caption, color in (
+        chips_row = ttk.Frame(top, style="TFrame")
+        chips_row.grid(row=0, column=0, sticky="ew")
+        self.chip_vars: dict[str, tuple[tk.StringVar, ttk.Label, str]] = {}
+        for index, (key, caption, role) in enumerate((
             ("moved", "Moved", "success"),
             ("failed", "Failed", "danger"),
             ("skipped", "Skipped", "warning"),
             ("errors", "Errors", "danger"),
-        ):
-            chip = Card(top, title=None)
-            chip.pack(side="left", padx=(0, 10))
+        )):
+            chips_row.columnconfigure(index, weight=1, uniform="chip")
+            chip = Card(chips_row, padding="sm")
+            chip.grid(row=0, column=index, sticky="ew",
+                      padx=(0 if index == 0 else sp("sm"), 0))
             var = tk.StringVar(value="0")
-            label = ttk.Label(chip, textvariable=var, style="Stat.TLabel",
-                              font=("Segoe UI", 15, "bold"), foreground=self.app.palette[color])
-            label.pack()
-            ttk.Label(chip, text=caption, style="StatCaption.TLabel").pack()
-            self.chip_vars[key] = (var, label, color)
+            label = ttk.Label(
+                chip.body, textvariable=var, style="Stat.TLabel",
+                font=theme.font("h2", "bold"),
+                foreground=self.app.palette[role],
+            )
+            label.pack(anchor="w")
+            ttk.Label(chip.body, text=caption,
+                      style="StatCaption.TLabel").pack(anchor="w")
+            self.chip_vars[key] = (var, label, role)
 
         self.cancel_btn = ttk.Button(
-            top, text="Cancel current run", style="Danger.TButton",
+            chips_row, text="Cancel current run", style="Danger.TButton",
             command=self.app.cancel_current,
         )
-        self.cancel_btn.pack(side="right")
+        self.cancel_btn.grid(row=0, column=4, sticky="e",
+                             padx=(sp("sm"), 0))
         self.cancel_btn.state(["disabled"])
 
-        self.autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            top, text="Auto-scroll", variable=self.autoscroll_var,
-            command=lambda: setattr(
-                self, "_autoscroll", bool(self.autoscroll_var.get())
-            ),
-        ).pack(side="right", padx=(0, 14))
+        controls = ttk.Frame(top, style="TFrame")
+        controls.grid(row=1, column=0, sticky="ew", pady=(sp("sm"), 0))
+        controls.columnconfigure(1, weight=1)
+
+        self.filter_var = tk.StringVar(value="all")
+        self.filter_control = SegmentedControl(
+            controls,
+            options=[("all", "All"), ("moved", "Moved"), ("failed", "Failed"),
+                     ("skipped", "Skipped"), ("error", "Errors"),
+                     ("info", "Info")],
+            variable=self.filter_var,
+            command=self._rebuild_text,
+            bg_style="TFrame",
+        )
+        self.filter_control.grid(row=0, column=0, sticky="w")
+
+        self.search = SearchBox(
+            controls, placeholder="Search the log…", width=24,
+            on_change=lambda _t: self._rebuild_text(),
+        )
+        self.search.grid(row=0, column=1, sticky="e", padx=(sp("sm"), 0))
 
         # Progress (hidden until a run starts)
         self.progress_frame = ttk.Frame(body, style="TFrame")
-        self.progress_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.progress_frame.grid(row=1, column=0, sticky="ew", pady=(0, sp("sm")))
+        self.progress_frame.columnconfigure(0, weight=1)
         self.progress_label_var = tk.StringVar(value="")
         ttk.Label(self.progress_frame, textvariable=self.progress_label_var,
-                  style="Muted.TLabel").pack(side="left")
+                  style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         self.progress = ttk.Progressbar(
-            self.progress_frame, mode="determinate", maximum=100, length=260
+            self.progress_frame, mode="determinate", maximum=100,
         )
-        self.progress.pack(side="right")
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(sp("xs"), 0))
         self.progress_frame.grid_remove()
 
         # Log
         log_card = Card(body, title="Event log")
         log_card.grid(row=2, column=0, sticky="nsew")
-        log_card.columnconfigure(0, weight=1)
-        log_card.rowconfigure(1, weight=1)
-
-        text_frame = ttk.Frame(log_card, style="Surface.TFrame")
-        text_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 4))
+        log_card.body.rowconfigure(0, weight=1)
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        log_card.header.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            log_card.header, text="Auto-scroll", variable=self.autoscroll_var,
+            command=lambda: setattr(
+                self, "_autoscroll", bool(self.autoscroll_var.get())
+            ),
+        ).grid(row=0, column=1, sticky="e")
+        text_frame = ttk.Frame(log_card.body, style="Surface.TFrame")
+        text_frame.grid(row=0, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
 
         self.text = tk.Text(
-            text_frame, wrap="word", height=16, state="disabled",
-            borderwidth=0, highlightthickness=0, padx=10, pady=8,
-            font=("Consolas", 10),
+            text_frame, wrap="word", height=14, state="disabled",
+            borderwidth=0, highlightthickness=0, padx=sp("sm"),
+            pady=sp("sm"), font=theme.font("small", mono=True),
         )
         tsb = ttk.Scrollbar(text_frame, orient="vertical",
                             command=self.text.yview, style="Vertical.TScrollbar")
         self.text.configure(yscrollcommand=tsb.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         tsb.grid(row=0, column=1, sticky="ns")
-        self.register(self.text, "surface")
-        ToolTip(self.text, "Everything EzSort reports during this session.")
+        self.register(self.text, "surface_sunken")
+        ToolTip(self.text, "Everything EzSort reports, newest at the bottom.")
 
         self._configure_tags()
 
     def _configure_tags(self) -> None:
         palette = self.app.palette
-        colors = TAG_COLORS if palette["name"] == "dark" else LIGHT_COLORS
-        for tag, color in colors.items():
-            self.text.tag_configure(tag, foreground=color)
-        self.text.tag_configure("time", foreground=palette["muted"])
         self.text.configure(
-            bg=palette["surface"], fg=palette["text"],
+            bg=palette["surface_sunken"], fg=palette["text"],
             insertbackground=palette["text"],
+            selectbackground=palette["selection"],
+            selectforeground=palette["selection_text"],
         )
+        for kind, role in KIND_ROLE.items():
+            self.text.tag_configure(kind, foreground=palette[role])
+        self.text.tag_configure("time", foreground=palette["text_disabled"])
+        self.text.tag_configure("message", foreground=palette["text"])
 
     # ------------------------------------------------------------------
 
@@ -146,7 +182,21 @@ class ActivityPage(Page):
         if kind in self.counts:
             self.counts[kind] += 1
             self._sync_chips()
-        self._append_line(entry)
+        self._entries.append(entry)
+        if self._matches(entry):
+            self._append_line(entry)
+
+    def _matches(self, entry: dict) -> bool:
+        kind = str(entry.get("type", "info"))
+        selected = self.filter_var.get()
+        if selected != "all" and kind != selected:
+            return False
+        query = self.search.value().lower()
+        if query:
+            haystack = f"{entry.get('message', '')} {kind}".lower()
+            if query not in haystack:
+                return False
+        return True
 
     def _sync_chips(self) -> None:
         mapping = {
@@ -160,29 +210,70 @@ class ActivityPage(Page):
 
     def _append_line(self, entry: dict) -> None:
         kind = entry.get("type", "info")
+        tag = kind if kind in KIND_ROLE else "info"
         self.text.configure(state="normal")
         self.text.insert("end", entry.get("time", ""), ("time",))
-        self.text.insert("end", "  " + entry.get("message", "") + "\n", (kind,))
-        if self.autoscroll_var.get():
+        self.text.insert("end", "  ", ())
+        self.text.insert("end", entry.get("message", "") + "\n",
+                         (tag, "message"))
+        if self._autoscroll:
             self.text.see("end")
         self.text.configure(state="disabled")
 
-    def render_all(self) -> None:
+    def _rebuild_text(self) -> None:
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
+        for entry in self._entries:
+            if self._matches(entry):
+                self._append_line(entry)
+
+    def render_all(self) -> None:
+        self._entries = list(self.app.activity)
         self.counts = {"moved": 0, "failed": 0, "skipped": 0, "error": 0}
-        for entry in self.app.activity:
-            self.append_entry(entry)
+        for entry in self._entries:
+            kind = entry.get("type", "info")
+            if kind in self.counts:
+                self.counts[kind] += 1
+        self._sync_chips()
+        self._rebuild_text()
+
+    def copy_log(self) -> None:
+        lines = []
+        for entry in self._entries:
+            if self._matches(entry):
+                lines.append(f"{entry.get('time', '')}  {entry.get('message', '')}")
+        if not lines:
+            self.app.toast("The log is empty.", "info")
+            return
+        try:
+            self.app.root.clipboard_clear()
+            self.app.root.clipboard_append("\n".join(lines))
+            self.app.toast(f"Copied {len(lines)} log line(s).", "success")
+        except Exception as e:  # pragma: no cover
+            self.app.toast(f"Could not copy the log: {e}", "error")
 
     def clear_view(self) -> None:
+        if not self._entries:
+            self.app.toast("The log is already empty.", "info")
+            return
+        dialog = ConfirmDialog(
+            self.app, "Clear the activity log?",
+            "The persisted log is deleted. History and files are not touched.",
+            details=f"{len(self._entries)} entry(s) will be removed.",
+            confirm_label="Clear log", danger=True,
+        )
+        if not dialog.show():
+            return
+        clear_activity()
         self.app.activity.clear()
+        self._entries.clear()
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
         self.counts = {"moved": 0, "failed": 0, "skipped": 0, "error": 0}
         self._sync_chips()
-        self.app.toast("Activity view cleared.", "info")
+        self.app.toast("Activity log cleared.", "info")
 
     # ------------------------------------------------------------------
     # Progress reporting (driven by the organizer page)
@@ -191,7 +282,8 @@ class ActivityPage(Page):
         try:
             self.progress_frame.grid()
             self.progress.configure(maximum=max(1, total), value=done)
-            self.progress_label_var.set(f"Organizing {done} / {total} files…")
+            self.progress_label_var.set(
+                f"Organizing {done} of {total} file(s)…")
         except Exception:
             pass
 
@@ -223,11 +315,15 @@ class ActivityPage(Page):
     def on_show(self) -> None:
         self.render_all()
 
+    def escape(self) -> None:
+        if self.search.value():
+            self.search.clear()
+
     def apply_theme(self) -> None:
         self._configure_tags()
-        for key, (var, label, color) in self.chip_vars.items():
+        for key, (_var, label, role) in self.chip_vars.items():
             try:
-                label.configure(fg=self.app.palette[color])
+                label.configure(foreground=self.app.palette[role])
             except Exception:
                 pass
         super().apply_theme()

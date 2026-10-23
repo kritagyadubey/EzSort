@@ -6,7 +6,9 @@ import logging
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
-from ezsort.gui.widgets import PageHeader
+from ezsort.gui import tokens
+from ezsort.gui.components import PageHeader
+from ezsort.gui.tokens import SPACE
 
 if TYPE_CHECKING:  # pragma: no cover
     from ezsort.gui.app import EzSortApp
@@ -14,24 +16,18 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def sp(key: str) -> int:
+    return tokens.sc(SPACE[key])
+
+
 class Page(ttk.Frame):
     """A navigation page with a header row and a body row.
 
     ``self.body`` is the widget pages fill; ``self.header`` provides the
-    title/subtitle and a slot for page-level actions.
+    title/purpose and a slot for page-level actions. Every page uses the
+    same outer padding and header rhythm so switching pages never makes
+    the content jump.
     """
-
-    #: Palette role mapping used by :meth:`register` for live re-theming.
-    ROLES = {
-        "bg": "bg",
-        "surface": "surface",
-        "surface_alt": "surface_alt",
-        "text": "text",
-        "muted": "muted",
-        "border": "border",
-        "selection": "selection",
-        "sidebar": "sidebar",
-    }
 
     def __init__(self, app: "EzSortApp", parent, title: str, subtitle: str = ""):
         super().__init__(parent, style="TFrame")
@@ -40,10 +36,12 @@ class Page(ttk.Frame):
         self.rowconfigure(1, weight=1)
 
         self.header = PageHeader(self, title, subtitle)
-        self.header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 16))
+        self.header.grid(row=0, column=0, sticky="ew",
+                         padx=sp("xl"), pady=(sp("xl"), sp("lg")))
 
         self.body = ttk.Frame(self, style="TFrame")
-        self.body.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 22))
+        self.body.grid(row=1, column=0, sticky="nsew",
+                       padx=sp("xl"), pady=(0, sp("lg")))
         self.body.columnconfigure(0, weight=1)
         self.body.rowconfigure(0, weight=1)
 
@@ -73,7 +71,8 @@ class Page(ttk.Frame):
                 logger.debug("Failed to re-theme widget", exc_info=True)
         self._themed = keep
 
-    def recolor_label(self, label, fg_role: str = "text", bg_role: str = "surface") -> None:
+    def recolor_label(self, label, fg_role: str = "text",
+                      bg_role: str = "surface") -> None:
         palette = self.app.palette
         try:
             label.configure(fg=palette[fg_role], bg=palette[bg_role])
@@ -87,3 +86,9 @@ class Page(ttk.Frame):
 
     def refresh(self) -> None:
         """Reload data from disk (override as needed)."""
+
+    def escape(self) -> None:
+        """Handle the Esc shortcut (override as needed)."""
+
+    def sync_folder(self) -> None:
+        """React to a folder change made elsewhere (override as needed)."""

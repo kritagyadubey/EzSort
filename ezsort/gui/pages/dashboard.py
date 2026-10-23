@@ -3,16 +3,34 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, ttk
 from typing import TYPE_CHECKING, Optional
 
 from ezsort import engine
-from ezsort.gui.pages import Page
-from ezsort.gui.theme import short_path
-from ezsort.gui.widgets import Card, ToolTip
+from ezsort.gui import tokens
+from ezsort.gui.components import (
+    Badge,
+    Card,
+    ConfirmDialog,
+    ScrollableFrame,
+    ToolTip,
+)
+from ezsort.gui.pages import Page, sp
+from ezsort.gui.theme import middle_ellipsis, short_path
 
 if TYPE_CHECKING:  # pragma: no cover
     from ezsort.gui.app import EzSortApp
+
+KIND_STYLE = {
+    "moved": ("SurfaceSuccess.TLabel", "success"),
+    "failed": ("SurfaceDanger.TLabel", "danger"),
+    "error": ("SurfaceDanger.TLabel", "danger"),
+    "cancelled": ("SurfaceWarning.TLabel", "warning"),
+    "undone": ("SurfaceInfo.TLabel", "info"),
+    "skipped": ("SurfaceWarning.TLabel", "warning"),
+    "info": ("SurfaceMuted.TLabel", "muted"),
+}
 
 
 class DashboardPage(Page):
@@ -24,128 +42,146 @@ class DashboardPage(Page):
         )
         self.preview: Optional[engine.PreviewResult] = None
         self._build()
-        self.header.action_button("Choose folder…", self.choose_folder)
-        self.header.action_button("Refresh", self.refresh)
+        self.header.secondary("Choose folder…", self.choose_folder)
+        self.header.secondary("Refresh", self.refresh, style="Ghost.TButton")
 
     # ------------------------------------------------------------------
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.body, style="TFrame")
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
+        body = self.body
+        body.rowconfigure(0, weight=0)
+        body.rowconfigure(1, weight=0)
+        body.rowconfigure(2, weight=1)
+        body.rowconfigure(3, weight=0)
 
         # Folder row -----------------------------------------------------
-        folder_card = Card(outer)
-        folder_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-        folder_card.columnconfigure(0, weight=1)
+        folder_card = Card(body, title="Folder", padding="md")
+        folder_card.grid(row=0, column=0, sticky="ew", pady=(0, sp("md")))
+        host = folder_card.body
 
-        row = ttk.Frame(folder_card, style="Surface.TFrame")
-        folder_card.add(row, pady=(4, 0))
+        row = ttk.Frame(host, style="Surface.TFrame")
+        row.grid(row=0, column=0, sticky="ew")
         row.columnconfigure(0, weight=1)
-
         self.folder_var = tk.StringVar(value=str(self.app.folder or ""))
-        entry = ttk.Entry(row, textvariable=self.folder_var, style="TEntry")
-        entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        entry.bind("<Return>", lambda e: self._apply_folder())
-        self.register(entry, "surface")
-        ttk.Button(row, text="Browse…", command=self.choose_folder).grid(
-            row=0, column=1, padx=(0, 8)
-        )
-        ttk.Button(
-            row, text="Use folder", style="Accent.TButton",
-            command=self._apply_folder,
-        ).grid(row=0, column=2)
+        self.folder_entry = ttk.Entry(row, textvariable=self.folder_var)
+        self.folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, sp("sm")))
+        self.folder_entry.bind("<Return>", lambda e: self._apply_folder())
+        ttk.Button(row, text="Browse…", style="Secondary.TButton",
+                   command=self.choose_folder).grid(row=0, column=1,
+                                                   padx=(0, sp("sm")))
+        ttk.Button(row, text="Use folder", style="Primary.TButton",
+                   command=self._apply_folder).grid(row=0, column=2)
 
+        summary_row = ttk.Frame(host, style="Surface.TFrame")
+        summary_row.grid(row=1, column=0, sticky="ew", pady=(sp("sm"), 0))
+        summary_row.columnconfigure(0, weight=1)
         self.folder_summary = ttk.Label(
-            folder_card, style="SurfaceMuted.TLabel",
+            summary_row, style="SurfaceMuted.TLabel", anchor="w",
             text="No folder selected yet - choose one to begin.",
         )
-        folder_card.add(self.folder_summary, pady=(10, 0))
+        self.folder_summary.grid(row=0, column=0, sticky="ew")
+        self.folder_badge = Badge(summary_row, "No folder", "muted")
+        self.folder_badge.grid(row=0, column=1, sticky="e")
+        ToolTip(self.folder_summary, lambda: self.folder_summary.cget("text"))
 
         # Stat cards ------------------------------------------------------
-        stats_row = ttk.Frame(outer, style="TFrame")
-        stats_row.grid(row=1, column=0, sticky="new", pady=(0, 14))
+        stats_row = ttk.Frame(body, style="TFrame")
+        stats_row.grid(row=1, column=0, sticky="ew", pady=(0, sp("md")))
         for i in range(4):
             stats_row.columnconfigure(i, weight=1, uniform="stat")
 
-        self.stat_vars = {}
+        self.stat_vars: dict[str, tk.StringVar] = {}
         captions = [
-            ("scanned", "Files scanned"),
-            ("ready", "Ready to organize"),
-            ("categories", "Categories found"),
-            ("last_run", "Files organized (all time)"),
+            ("scanned", "Files scanned", "Files EzSort can see in the folder"),
+            ("ready", "Ready to organize", "Planned moves that can run now"),
+            ("categories", "Categories found", "Distinct destinations in the plan"),
+            ("organized", "Files organized", "Successful moves recorded in history"),
         ]
-        for i, (key, caption) in enumerate(captions):
-            card = Card(stats_row)
-            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
-            value = ttk.Label(card, text="—", style="Stat.TLabel")
-            card.add(value, pady=(2, 0))
-            label = ttk.Label(card, text=caption, style="StatCaption.TLabel")
-            card.add(label, pady=(2, 0))
-            self.stat_vars[key] = value
+        for i, (key, caption, tip) in enumerate(captions):
+            card = Card(stats_row, padding="md")
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0 if i == 0 else sp("sm"), 0))
+            var = tk.StringVar(value="—")
+            value = ttk.Label(card.body, textvariable=var, style="Stat.TLabel")
+            value.grid(row=0, column=0, sticky="w")
+            ttk.Label(card.body, text=caption, style="StatCaption.TLabel").grid(
+                row=1, column=0, sticky="w", pady=(sp("xxs"), 0))
+            self.stat_vars[key] = var
+            ToolTip(card, tip)
 
         # Lower area: distribution + recent activity -----------------------
-        lower = ttk.Frame(outer, style="TFrame")
-        lower.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
-        outer.rowconfigure(2, weight=1)
+        lower = ttk.Frame(body, style="TFrame")
+        lower.grid(row=2, column=0, sticky="nsew", pady=(0, sp("md")))
         lower.columnconfigure(0, weight=3)
         lower.columnconfigure(1, weight=2)
+        lower.rowconfigure(0, weight=1)
 
-        # Distribution
         dist_card = Card(lower, title="Category distribution")
-        dist_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 14))
-        dist_card.columnconfigure(1, weight=1)
-        self.dist_container = ttk.Frame(dist_card, style="Surface.TFrame")
-        self.dist_container.grid(row=dist_card.next_row, column=0, sticky="nsew")
+        dist_card.grid(row=0, column=0, sticky="nsew", padx=(0, sp("md")))
+        dist_card.body.rowconfigure(0, weight=1)
+        self.dist_scroll = ScrollableFrame(
+            dist_card.body, bg_role="surface", auto_hide=True,
+        )
+        self.dist_scroll.grid(row=0, column=0, sticky="nsew")
+        self.dist_container = self.dist_scroll.body
         self.dist_container.columnconfigure(1, weight=1)
-        self._dist_rows: list[tuple[str, ttk.Label, ttk.Label, ttk.Frame]] = []
-        ttk.Label(
+        self._dist_empty = ttk.Label(
             self.dist_container, style="SurfaceMuted.TLabel",
-            text="Pick a folder and hit Refresh to see the breakdown.",
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
+            text="Pick a folder and press Refresh to see the breakdown.",
+        )
+        self._dist_empty.grid(row=0, column=0, columnspan=3, sticky="w")
 
-        # Recent activity
         recent_card = Card(lower, title="Recent activity")
-        recent_card.grid(row=0, column=1, sticky="nsew", pady=(0, 14))
-        recent_card.columnconfigure(0, weight=1)
-        self.recent_list = ttk.Frame(recent_card, style="Surface.TFrame")
-        recent_card.add(self.recent_list, pady=(4, 0))
-        self.recent_list.columnconfigure(0, weight=1)
-        ttk.Label(
-            self.recent_list, style="SurfaceMuted.TLabel",
-            text="Actions taken in this session and past sorts appear here.",
-        ).grid(row=0, column=0, sticky="w")
+        recent_card.grid(row=0, column=1, sticky="nsew")
+        recent_card.body.rowconfigure(0, weight=1)
+        self.recent_scroll = ScrollableFrame(
+            recent_card.body, bg_role="surface", auto_hide=True,
+        )
+        self.recent_scroll.grid(row=0, column=0, sticky="nsew")
+        self.recent_list = self.recent_scroll.body
+        self.recent_list.columnconfigure(2, weight=1)
+        self._recent_messages: list[ttk.Label] = []
+        self.recent_list.bind("<Configure>", self._resize_recent, add="+")
+        # Entries stay top-aligned; a trailing spacer row absorbs extra height.
+        self.recent_list.rowconfigure(10, weight=1)
 
         # Quick actions ----------------------------------------------------
-        actions = ttk.Frame(outer, style="TFrame")
-        actions.grid(row=3, column=0, sticky="ew", pady=(0, 2))
+        actions = ttk.Frame(body, style="TFrame")
+        actions.grid(row=3, column=0, sticky="ew")
         self.preview_btn = ttk.Button(
-            actions, text="Preview folder", style="Accent.TButton",
+            actions, text="Preview folder", style="Primary.TButton",
             command=self.preview_folder,
         )
         self.preview_btn.pack(side="left")
         ttk.Button(
-            actions, text="Open Organizer", style="Small.TButton",
+            actions, text="Open Organizer", style="Secondary.TButton",
             command=lambda: self.app.show_page("organizer"),
-        ).pack(side="left", padx=(10, 0))
+        ).pack(side="left", padx=(sp("sm"), 0))
+        self.undo_btn = ttk.Button(
+            actions, text="Undo last sort", style="Secondary.TButton",
+            command=self.undo_last, state="disabled",
+        )
+        self.undo_btn.pack(side="left", padx=(sp("sm"), 0))
         ttk.Button(
-            actions, text="Undo last sort", style="Small.TButton",
-            command=self.undo_last,
-        ).pack(side="left", padx=(10, 0))
-        ttk.Button(
-            actions, text="View history", style="Small.TButton",
+            actions, text="View history", style="Secondary.TButton",
             command=lambda: self.app.show_page("history"),
-        ).pack(side="left", padx=(10, 0))
+        ).pack(side="left", padx=(sp("sm"), 0))
 
     # ------------------------------------------------------------------
+
+    def sync_folder(self) -> None:
+        self.folder_var.set(str(self.app.folder or ""))
+        self.folder_badge.set(
+            "Folder selected" if self.app.folder else "No folder",
+            "neutral" if self.app.folder else "muted")
 
     def choose_folder(self) -> None:
         import os
 
         initial = str(self.app.folder) if self.app.folder else os.path.expanduser("~")
         chosen = filedialog.askdirectory(
-            title="Choose a folder to organize", initialdir=initial, parent=self.app.root
+            title="Choose a folder to organize", initialdir=initial,
+            parent=self.app.root,
         )
         if chosen:
             self.folder_var.set(chosen)
@@ -156,13 +192,13 @@ class DashboardPage(Page):
         if not raw:
             self.app.toast("Type or choose a folder first.", "warning")
             return
-        from pathlib import Path
-
         folder = Path(raw).expanduser()
         if not folder.is_dir():
             self.app.toast(f"Not a folder: {folder}", "error")
+            self.folder_badge.set("Not a folder", "danger")
             return
-        self.app.folder = folder.resolve()
+        folder = folder.resolve()
+        self.app.set_folder(folder)
         self.app.log({"type": "info", "message": f"Selected folder {folder}"})
         self.app.toast(f"Folder set: {short_path(str(folder), 60)}", "success")
         org = self.app.pages.get("organizer")
@@ -178,6 +214,7 @@ class DashboardPage(Page):
             return
         self.preview_btn.state(["disabled"])
         self.folder_summary.configure(text=f"Scanning {short_path(str(folder), 80)} …")
+        self.folder_badge.set("Scanning…", "info")
 
         config = dict(self.app.config)
         recursive = bool(config.get("recursive", False))
@@ -211,6 +248,7 @@ class DashboardPage(Page):
         def failed(exc: BaseException):
             self.preview_btn.state(["!disabled"])
             self.folder_summary.configure(text=f"Scan failed: {exc}")
+            self.folder_badge.set("Scan failed", "danger")
             self.app.toast(f"Scan failed: {exc}", "error")
             self.app.log({"type": "error", "message": f"Scan failed: {exc}"})
 
@@ -222,6 +260,7 @@ class DashboardPage(Page):
             self.folder_summary.configure(
                 text="Another operation is running - try again shortly."
             )
+            self.folder_badge.set("Busy", "warning")
 
     def _render(self, preview: engine.PreviewResult) -> None:
         folder = preview.folder
@@ -234,62 +273,66 @@ class DashboardPage(Page):
         if preview.skipped:
             parts.append(f"{len(preview.skipped)} skipped")
         self.folder_summary.configure(text="  |  ".join(parts))
-        ToolTip(self.folder_summary, lambda: str(folder))
+        self.folder_badge.set(
+            "Ready to sort" if preview.ready else "Already organized",
+            "success" if preview.ready else "neutral")
 
-        self.stat_vars["scanned"].configure(text=str(len(preview.files)))
-        self.stat_vars["ready"].configure(text=str(len(preview.operations)))
-        self.stat_vars["categories"].configure(text=str(len(preview.categories)))
+        self.stat_vars["scanned"].set(str(len(preview.files)))
+        self.stat_vars["ready"].set(str(len(preview.operations)))
+        self.stat_vars["categories"].set(str(len(preview.categories)))
 
-        # Last-run number from history
         stats = engine.stats()
-        self.stat_vars["last_run"].configure(text=str(stats["total_moved"]))
+        self.stat_vars["organized"].set(str(stats["total_moved"]))
+        self._sync_undo_button(bool(engine.load_history()))
 
         self._render_distribution(preview.categories)
         self.refresh_recent()
 
     def _render_distribution(self, categories: dict[str, int]) -> None:
-        for row in self.dist_container.winfo_children():
-            row.destroy()
-        self._dist_rows.clear()
+        for child in list(self.dist_container.winfo_children()):
+            if child is not self._dist_empty:
+                child.destroy()
+        self._dist_empty.grid_remove()
 
         if not categories:
-            ttk.Label(
-                self.dist_container, style="SurfaceMuted.TLabel",
-                text="No files to show yet.",
-            ).grid(row=0, column=0, columnspan=4, sticky="w")
+            self._dist_empty.grid()
             return
 
         max_count = max(categories.values()) or 1
         ordered = sorted(categories.items(), key=lambda kv: (-kv[1], kv[0]))
         palette = self.app.palette
-
-        for i, (name, count) in enumerate(ordered, start=1):
+        row = 0
+        for name, count in ordered:
             name_lbl = ttk.Label(
-                self.dist_container, text=name, style="Surface.TLabel", width=14
+                self.dist_container, text=name, style="SurfaceSmall.TLabel",
             )
-            name_lbl.grid(row=i, column=0, sticky="w", pady=3, padx=(0, 8))
+            name_lbl.grid(row=row, column=0, sticky="w",
+                          pady=(0, sp("xxs")), padx=(0, sp("sm")))
 
-            track = tk.Frame(
-                self.dist_container, bg=palette["surface_alt"], height=9
-            )
-            track.grid(row=i, column=1, sticky="ew", pady=3)
+            track = tk.Frame(self.dist_container, bg=palette["surface_alt"],
+                             height=tokens.sc(8))
+            track.grid(row=row, column=1, sticky="ew", pady=(0, sp("xxs")))
             track.grid_propagate(False)
             fraction = max(0.03, count / max_count)
-            fill = tk.Frame(track, bg=palette["accent"], height=9)
+            fill = tk.Frame(track, bg=palette["accent"], height=tokens.sc(8))
             fill.place(x=0, y=0, relwidth=fraction, relheight=1.0)
             self.register(track, "surface_alt")
+            self.register(fill, "accent")
 
             count_lbl = ttk.Label(
-                self.dist_container, text=str(count), style="Surface.TLabel",
+                self.dist_container, text=str(count), style="SurfaceSmall.TLabel",
                 width=5, anchor="e",
             )
-            count_lbl.grid(row=i, column=2, sticky="e", pady=3)
+            count_lbl.grid(row=row, column=2, sticky="e",
+                           pady=(0, sp("xxs")), padx=(sp("xs"), sp("md")))
+            row += 1
 
     def refresh_recent(self) -> None:
-        for child in self.recent_list.winfo_children():
+        for child in list(self.recent_list.winfo_children()):
             child.destroy()
+        self._recent_messages = []
 
-        entries = list(reversed(self.app.activity[-6:]))
+        entries = list(reversed(self.app.activity[-4:]))
         if not entries:
             # Fall back to persisted history batches.
             history = engine.load_history()
@@ -309,62 +352,79 @@ class DashboardPage(Page):
             ttk.Label(
                 self.recent_list, style="SurfaceMuted.TLabel",
                 text="Nothing yet - organize a folder to get started.",
-            ).grid(row=0, column=0, sticky="w")
+                wraplength=tokens.sc(360), justify="left",
+            ).grid(row=0, column=0, columnspan=3, sticky="w")
             return
 
-        palette = self.app.palette
-        color_map = {
-            "moved": palette["success"],
-            "failed": palette["danger"],
-            "error": palette["danger"],
-            "info": palette["muted"],
-            "skipped": palette["warning"],
-            "undone": palette["accent"],
-        }
         for i, entry in enumerate(entries):
-            text = f"{entry.get('time', '')}  {entry.get('message', '')}"
-            lbl = tk.Label(
-                self.recent_list,
-                text=text[:80] + ("…" if len(text) > 80 else ""),
-                bg=palette["surface"],
-                fg=color_map.get(entry.get("type", "info"), palette["text"]),
-                font=("Segoe UI", 9),
-                anchor="w",
-                justify="left",
+            style, kind = KIND_STYLE.get(entry.get("type", "info"),
+                                         KIND_STYLE["info"])
+            time_text = str(entry.get("time", ""))
+            ttk.Label(self.recent_list, text=time_text, width=8, anchor="w",
+                      style="SurfaceMicro.TLabel").grid(
+                row=i, column=0, sticky="nw", padx=(0, sp("sm")),
+                pady=(0, sp("xs")))
+            Badge(self.recent_list, kind.capitalize(), kind).grid(
+                row=i, column=1, sticky="nw", padx=(0, sp("sm")),
+                pady=(0, sp("xs")))
+            message = str(entry.get("message", ""))
+            lbl = ttk.Label(
+                self.recent_list, text=middle_ellipsis(message, 90),
+                style=style, justify="left", anchor="w",
+                wraplength=tokens.sc(300),
             )
-            lbl.grid(row=i, column=0, sticky="w", pady=2)
-            self.register(lbl, "surface")
-            ToolTip(lbl, text)
+            lbl.grid(row=i, column=2, sticky="nw", pady=(0, sp("xs")))
+            self._recent_messages.append(lbl)
+            ToolTip(lbl, message)
+
+    def _resize_recent(self, event) -> None:
+        """Wrap recent messages to the card width instead of squeezing time."""
+        wrap = max(tokens.sc(150), int(event.width) - tokens.sc(150))
+        for label in self._recent_messages:
+            try:
+                label.configure(wraplength=wrap)
+            except tk.TclError:  # pragma: no cover - destroyed
+                pass
 
     # ------------------------------------------------------------------
 
+    def _sync_undo_button(self, has_history: bool) -> None:
+        self.undo_btn.state(["!disabled"] if has_history else ["disabled"])
+
     def on_show(self) -> None:
+        self.sync_folder()
+        stats = engine.stats()
+        self.stat_vars["organized"].set(str(stats["total_moved"]))
+        self._sync_undo_button(bool(engine.load_history()))
+        self.refresh_recent()
         if self.app.folder is None:
-            self.folder_var.set("")
             return
         self.folder_var.set(str(self.app.folder))
-        if self.preview is None:
+        if self.preview is None and not self.app.is_busy():
             self.preview_folder()
-        else:
-            stats = engine.stats()
-            self.stat_vars["last_run"].configure(text=str(stats["total_moved"]))
-            self.refresh_recent()
 
     def undo_last(self) -> None:
         history = engine.load_history()
         if not history:
+            self._sync_undo_button(False)
             self.app.toast("Nothing to undo yet.", "info")
             return
-        if not self.app.config.get("confirm_before_move", True):
-            self._do_undo()
-            return
-        if messagebox.askyesno(
-            "Undo last sort",
-            "Restore the files from the most recent sort to their original "
-            "locations?",
-            parent=self.app.root,
-        ):
-            self._do_undo()
+        batch = history[-1]
+        if self.app.config.get("confirm_before_move", True):
+            dialog = ConfirmDialog(
+                self.app, "Undo the last sort?",
+                "Files from this sort will move back to where they came from.",
+                details=(
+                    f"Batch {batch.get('batch_id')}: "
+                    f"{batch.get('total_moved', 0)} file(s)\n"
+                    f"Folder: {batch.get('folder', '(not recorded)')}\n\n"
+                    "Nothing at the original location is ever overwritten."
+                ),
+                confirm_label="Undo this sort",
+            )
+            if not dialog.show():
+                return
+        self._do_undo()
 
     def _do_undo(self) -> None:
         def work():
@@ -378,6 +438,7 @@ class DashboardPage(Page):
             })
             self.app.toast(message, "success" if success else "error")
             self.preview = None
+            self._sync_undo_button(bool(engine.load_history()))
             if self.app.current_page == "dashboard":
                 self.preview_folder()
 
@@ -386,3 +447,8 @@ class DashboardPage(Page):
     def refresh(self) -> None:
         self.preview = None
         self.preview_folder()
+
+    def apply_theme(self) -> None:
+        if self.preview is not None:
+            self._render_distribution(self.preview.categories)
+        super().apply_theme()

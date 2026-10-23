@@ -1,20 +1,33 @@
-"""Main window: sidebar navigation, page hosting, shared state and status."""
+"""Main window: sidebar navigation, page hosting, shared state and status.
+
+The shell owns every cross-page service (configuration, background tasks,
+activity log, theming, toasts) so pages only describe their own content.
+"""
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 import tkinter as tk
+import traceback
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from typing import Any, Callable, Optional
 
 from ezsort import __version__
-from ezsort.config import get_config_dir, get_config_path, load_config, save_config
-from ezsort.gui import icons
-from ezsort.gui.theme import apply_styles, get_palette, short_path
+from ezsort.activity import append_activity, load_activity, save_activity
+from ezsort.config import (
+    get_config_dir,
+    get_config_path,
+    load_config,
+    save_config,
+)
+from ezsort.gui import components, icons, theme, tokens
+from ezsort.gui.components import ErrorDialog, IconCanvas, Toast
+from ezsort.gui.tokens import SPACE
 from ezsort.gui.workers import CancelToken, TaskRunner
 
 logger = logging.getLogger(__name__)
@@ -29,6 +42,8 @@ NAV_ITEMS = [
 ]
 
 MAX_ACTIVITY = 500
+
+_GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
 
 
 def app_icon_path() -> Optional[Path]:
@@ -61,27 +76,36 @@ def app_icon_path() -> Optional[Path]:
     return None
 
 
+def _sp(key: str) -> int:
+    return tokens.sc(SPACE[key])
+
+
 class EzSortApp:
     """The EzSort desktop application."""
 
     def __init__(self) -> None:
-        self.root = tk.Tk()
-        self.root.title(f"EzSort {__version__}")
-        self.root.minsize(980, 640)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self._set_window_icon()
-
+        # DPI awareness must be requested *before* the first Tk window is
+        # created, otherwise Windows bitmap-scales the whole UI.
         self._enable_dpi_awareness()
+        self.root = tk.Tk()
+        self._set_scale()
+
+        self.root.title(f"EzSort {__version__}")
+        self.root.minsize(tokens.sc(tokens.MIN_WINDOW[0]),
+                          tokens.sc(tokens.MIN_WINDOW[1]))
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = self._report_callback_exception
+        self._set_window_icon()
 
         # --- state -------------------------------------------------------
         self.config: dict[str, Any] = load_config()
-        self.palette = get_palette(self.config.get("theme", "dark"))
+        self.palette = theme.get_palette(self.config.get("theme", "dark"))
         self.folder: Optional[Path] = None
         last = self.config.get("last_folder") or self.config.get("default_folder")
         if last and Path(last).expanduser().is_dir():
             self.folder = Path(last).expanduser()
 
-        self.activity: list[dict] = []
+        self.activity: list[dict] = load_activity(MAX_ACTIVITY)
         self.runner = TaskRunner(self.root)
         self._task_lock = threading.Lock()
         #: One cancel token per running task (label -> token), so a
@@ -96,13 +120,18 @@ class EzSortApp:
         self._watch_stop: Optional[threading.Event] = None
         self.pages: dict[str, Any] = {}
         self.current_page = ""
+        self._nav_buttons: dict[str, dict] = {}
 
         # --- chrome ------------------------------------------------------
-        apply_styles(self.root, self.palette)
+        theme.apply_styles(self.root, self.palette)
         self._build_layout()
         self._bind_shortcuts()
         self._restore_geometry()
-        self.show_page("dashboard")
+        self._refresh_status()
+        start = str(self.config.get("last_page") or "dashboard")
+        if start not in dict(NAV_ITEMS):
+            start = "dashboard"
+        self.show_page(start)
 
     # ------------------------------------------------------------------
     # Window / chrome
@@ -130,6 +159,15 @@ class EzSortApp:
         except Exception:
             pass
 
+    def _set_scale(self) -> None:
+        """Derive one UI scale from the real display DPI."""
+        dpi = 96.0
+        try:
+            dpi = float(self.root.winfo_fpixels("1i"))
+        except Exception:  # pragma: no cover - unusual Tk build
+            pass
+        tokens.set_scale(tokens.scale_from_dpi(dpi))
+
     def _set_window_icon(self) -> None:
         """Use the real EzSort icon for the window (title bar, taskbar)."""
         icon = app_icon_path()
@@ -141,24 +179,64 @@ class EzSortApp:
             logger.debug("Could not set window icon", exc_info=True)
 
     def _bind_shortcuts(self) -> None:
-        """Keyboard navigation: Ctrl+1..6 jump to pages, F5 refreshes."""
+        """Keyboard navigation: Ctrl+1..6 pages, Ctrl+F search, F5 refresh."""
         for index, (key, _label) in enumerate(NAV_ITEMS, start=1):
             self.root.bind_all(
                 f"<Control-Key-{index}>",
                 lambda _e, k=key: self.show_page(k),
             )
         self.root.bind_all("<F5>", self._refresh_current_page)
+        self.root.bind_all("<Control-f>", self._focus_search)
+        self.root.bind_all("<Control-F>", self._focus_search)
+        self.root.bind_all("<Control-o>", self._choose_folder_shortcut)
+        self.root.bind_all("<Control-O>", self._choose_folder_shortcut)
+        self.root.bind_all("<F1>", self._show_shortcuts)
+        self.root.bind_all("<Escape>", self._escape)
 
     def _refresh_current_page(self, _event=None) -> None:
         page = self.pages.get(self.current_page)
-        if page is None:
-            return
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             try:
                 refresh()
             except Exception:
                 logger.exception("page refresh failed")
+        return "break"
+
+    def _focus_search(self, _event=None) -> str:
+        page = self.pages.get("organizer")
+        if page is None:
+            self.show_page("organizer")
+            page = self.pages.get("organizer")
+        if self.current_page != "organizer":
+            self.show_page("organizer")
+        focus = getattr(page, "focus_search", None)
+        if callable(focus):
+            focus()
+        return "break"
+
+    def _choose_folder_shortcut(self, _event=None) -> str:
+        page = self.pages.get("organizer")
+        if page is None:
+            self.show_page("organizer")
+            page = self.pages.get("organizer")
+        choose = getattr(page, "choose_folder", None)
+        if callable(choose):
+            choose()
+        return "break"
+
+    def _show_shortcuts(self, _event=None) -> str:
+        components.ShortcutsDialog(self).show()
+        return "break"
+
+    def _escape(self, _event=None) -> None:
+        page = self.pages.get(self.current_page)
+        clear = getattr(page, "escape", None)
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                logger.debug("escape handler failed", exc_info=True)
 
     def _build_layout(self) -> None:
         p = self.palette
@@ -166,111 +244,152 @@ class EzSortApp:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Sidebar
-        self.sidebar = tk.Frame(self.root, bg=p["sidebar"], width=224, padx=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsw")
-        self.sidebar.grid_propagate(False)
+        self._build_sidebar()
 
-        brand = tk.Frame(self.sidebar, bg=p["sidebar"])
-        brand.pack(fill="x", padx=18, pady=(22, 4))
-        brand_title = tk.Label(
-            brand, text="EzSort", bg=p["sidebar"], fg=p["text"],
-            font=("Segoe UI", 19, "bold"), anchor="w",
-        )
-        brand_title.pack(side="left")
-        brand_version = tk.Label(
-            brand, text=f"v{__version__}", bg=p["sidebar"], fg=p["muted"],
-            font=("Segoe UI", 9),
-        )
-        brand_version.pack(side="right", pady=(8, 0))
-        brand_tagline = tk.Label(
-            self.sidebar, text="Keep your files sorted,\neffortlessly.",
-            bg=p["sidebar"], fg=p["muted"], font=("Segoe UI", 9),
-            justify="left", anchor="w",
-        )
-        brand_tagline.pack(fill="x", padx=18, pady=(2, 18))
-        # Kept so a theme switch can recolor the brand block (it is plain
-        # tk widgets, not ttk, so ttk styles alone never reach it).
-        self._brand_widgets = [
-            (brand, "sidebar", None),
-            (brand_title, "sidebar", "text"),
-            (brand_version, "sidebar", "muted"),
-            (brand_tagline, "sidebar", "muted"),
-        ]
-
-        sep = tk.Frame(self.sidebar, bg=p["border"], height=1)
-        sep.pack(fill="x", padx=14, pady=(0, 8))
-        self._sidebar_separators = [sep]
-
-        self._nav_buttons: dict[str, dict] = {}
-        for key, label in NAV_ITEMS:
-            row = tk.Frame(self.sidebar, bg=p["sidebar"], cursor="hand2")
-            row.pack(fill="x", padx=10, pady=2)
-            icon = tk.Canvas(row, width=18, height=18, bg=p["sidebar"],
-                             highlightthickness=0)
-            icon.pack(side="left", padx=(10, 10), pady=9)
-            text = tk.Label(row, text=label, bg=p["sidebar"], fg=p["muted"],
-                            font=("Segoe UI", 10), anchor="w", cursor="hand2")
-            text.pack(side="left", fill="x", pady=9)
-            btn = {"frame": row, "icon": icon, "label": text, "key": key}
-            self._nav_buttons[key] = btn
-            for widget in (row, icon, text):
-                widget.bind("<Enter>", lambda e, b=btn: self._hover_nav(b, True))
-                widget.bind("<Leave>", lambda e, b=btn: self._hover_nav(b, False))
-                widget.bind(
-                    "<Button-1>",
-                    lambda e, k=key: self.show_page(k),
-                )
-
-        # Sidebar footer: folder + engine status
-        sep2 = tk.Frame(self.sidebar, bg=p["border"], height=1)
-        sep2.pack(side="bottom", fill="x", padx=14, pady=8)
-        self._sidebar_separators.append(sep2)
-        self.sidebar_status = tk.Label(
-            self.sidebar, text="Ready", bg=p["sidebar"], fg=p["muted"],
-            font=("Segoe UI", 9), anchor="w", justify="left", wraplength=190,
-        )
-        self.sidebar_status.pack(side="bottom", fill="x", padx=18, pady=(4, 16))
-        # Content area
-        self.container = tk.Frame(self.root, bg=p["bg"])
+        self.container = ttk.Frame(self.root, style="TFrame")
         self.container.grid(row=0, column=1, sticky="nsew")
         self.container.rowconfigure(0, weight=1)
         self.container.columnconfigure(0, weight=1)
 
-        # Status bar
-        self.statusbar = tk.Frame(self.root, bg=p["surface"], height=28)
+        self._build_statusbar()
+        self.toast_host = Toast(self, self.container)
+
+    def _build_sidebar(self) -> None:
+        p = self.palette
+        sidebar_width = _sp("xl") + tokens.sc(tokens.SIDEBAR_WIDTH)
+        # A weighted content column would otherwise squeeze the sidebar below
+        # its designed width on narrow screens.
+        self.root.columnconfigure(0, minsize=sidebar_width)
+        self.sidebar = tk.Frame(self.root, bg=p["sidebar"], width=sidebar_width)
+        self.sidebar.grid(row=0, column=0, sticky="nsw")
+        self.sidebar.grid_propagate(False)
+
+        brand = tk.Frame(self.sidebar, bg=p["sidebar"])
+        brand.pack(fill="x", padx=_sp("lg"), pady=(_sp("xl"), 0))
+        brand_title = tk.Label(
+            brand, text="EzSort", bg=p["sidebar"], fg=p["text"],
+            font=theme.font("h1", "bold"), anchor="w",
+        )
+        brand_title.pack(side="left")
+        brand_version = tk.Label(
+            brand, text=f"v{__version__}", bg=p["sidebar"],
+            fg=p["text_secondary"], font=theme.font("small"),
+        )
+        brand_version.pack(side="right", pady=(_sp("xs"), 0))
+        brand_tagline = tk.Label(
+            self.sidebar, text="Keep every download in its place.",
+            bg=p["sidebar"], fg=p["text_secondary"], font=theme.font("small"),
+            justify="left", anchor="w", wraplength=tokens.sc(190),
+        )
+        brand_tagline.pack(fill="x", padx=_sp("lg"), pady=(_sp("xxs"), _sp("lg")))
+        # Kept so a theme switch can recolor the brand block (plain tk
+        # widgets are not reached by ttk styles).
+        self._brand_widgets = [
+            (brand, "sidebar", None),
+            (brand_title, "sidebar", "text"),
+            (brand_version, "sidebar", "text_secondary"),
+            (brand_tagline, "sidebar", "text_secondary"),
+        ]
+
+        self._sidebar_separators: list[tk.Frame] = []
+        sep = tk.Frame(self.sidebar, bg=p["border"], height=1)
+        sep.pack(fill="x", padx=_sp("md"), pady=(0, _sp("sm")))
+        self._sidebar_separators.append(sep)
+
+        for key, label in NAV_ITEMS:
+            row = ttk.Frame(self.sidebar, style="Nav.TFrame",
+                            cursor="hand2")
+            row.pack(fill="x", padx=_sp("sm"), pady=_sp("xxs"))
+            row.columnconfigure(2, weight=1)
+            bar = ttk.Frame(row, style="NavBar.TFrame", width=_sp("xxs"))
+            bar.grid(row=0, column=0, sticky="ns")
+            bar.grid_propagate(False)
+            icon = IconCanvas(row, key, role="text_secondary",
+                              bg_role="sidebar", size=tokens.sc(icons.SIZE))
+            icon.grid(row=0, column=1, padx=(_sp("md"), _sp("sm")),
+                      pady=_sp("sm"))
+            text = ttk.Label(row, text=label, style="Nav.TLabel", anchor="w")
+            text.grid(row=0, column=2, sticky="ew", padx=(0, _sp("sm")),
+                      pady=_sp("sm"))
+            btn = {"frame": row, "bar": bar, "icon": icon, "label": text,
+                   "key": key}
+            self._nav_buttons[key] = btn
+            for widget in (row, bar, icon, text):
+                widget.bind("<Enter>", lambda e, b=btn: self._hover_nav(b, True))
+                widget.bind("<Leave>", lambda e, b=btn: self._hover_nav(b, False))
+                widget.bind("<Button-1>", lambda e, k=key: self.show_page(k))
+
+        # Sidebar footer: folder + engine status
+        sep2 = tk.Frame(self.sidebar, bg=p["border"], height=1)
+        sep2.pack(side="bottom", fill="x", padx=_sp("md"), pady=_sp("sm"))
+        self._sidebar_separators.append(sep2)
+        self.sidebar_status_var = tk.StringVar(value="Ready")
+        self.sidebar_status = ttk.Label(
+            self.sidebar, textvariable=self.sidebar_status_var,
+            style="SidebarMuted.TLabel", anchor="w", justify="left",
+            wraplength=tokens.sc(190),
+        )
+        self.sidebar_status.pack(side="bottom", fill="x", padx=_sp("lg"),
+                                 pady=(_sp("xs"), _sp("lg")))
+
+    def _build_statusbar(self) -> None:
+        self.statusbar = ttk.Frame(self.root, style="Status.TFrame",
+                                   height=_sp("xl"))
         self.statusbar.grid(row=1, column=0, columnspan=2, sticky="ew")
         self.statusbar.grid_propagate(False)
+        rule = ttk.Frame(self.statusbar, style="StatusRule.TFrame",
+                         height=tokens.sc(1))
+        rule.pack(side="top", fill="x")
+        inner = ttk.Frame(self.statusbar, style="Status.TFrame")
+        inner.pack(fill="both", expand=True, padx=_sp("md"))
         self.status_var = tk.StringVar(value="Ready")
-        self.status_label = tk.Label(
-            self.statusbar, textvariable=self.status_var, bg=p["surface"],
-            fg=p["muted"], font=("Segoe UI", 9), anchor="w", padx=14,
+        self.status_label = ttk.Label(
+            inner, textvariable=self.status_var, style="Status.TLabel",
+            anchor="w",
         )
         self.status_label.pack(side="left", fill="x", expand=True)
-        self.task_label = tk.Label(
-            self.statusbar, text="", bg=p["surface"], fg=p["muted"],
-            font=("Segoe UI", 9), anchor="e", padx=14,
+        self.task_var = tk.StringVar(value="")
+        self.task_label = ttk.Label(
+            inner, textvariable=self.task_var, style="StatusStrong.TLabel",
+            anchor="e",
         )
         self.task_label.pack(side="right")
-
-    def _hover_nav(self, btn: dict, entering: bool) -> None:
-        p = self.palette
-        selected = btn["key"] == self.current_page
-        if selected:
-            bg, fg = p["selection"], p["text"]
-        else:
-            bg, fg = (p["surface_alt"], p["text"]) if entering else (p["sidebar"], p["muted"])
-        btn["frame"].configure(bg=bg)
-        btn["label"].configure(bg=bg, fg=fg)
-        btn["icon"].configure(bg=bg)
-        icons.draw_icon(
-            btn["icon"], btn["key"],
-            p["text"] if (entering or selected) else p["muted"],
-        )
 
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
+
+    def _hover_nav(self, btn: dict, entering: bool) -> None:
+        if btn["key"] == self.current_page:
+            return
+        style = "NavHover.TFrame" if entering else "Nav.TFrame"
+        label_style = "NavHover.TLabel" if entering else "Nav.TLabel"
+        try:
+            btn["frame"].configure(style=style)
+            btn["label"].configure(style=label_style)
+            btn["icon"].set_roles(
+                "surface_alt" if entering else "sidebar",
+                "text" if entering else "text_secondary",
+            )
+        except tk.TclError:
+            pass
+
+    def _paint_nav(self) -> None:
+        for key, btn in self._nav_buttons.items():
+            selected = key == self.current_page
+            try:
+                btn["frame"].configure(
+                    style="NavActive.TFrame" if selected else "Nav.TFrame")
+                btn["label"].configure(
+                    style="NavActive.TLabel" if selected else "Nav.TLabel")
+                btn["bar"].configure(
+                    style="NavBarActive.TFrame" if selected else "NavBar.TFrame")
+                btn["icon"].set_roles(
+                    "selection" if selected else "sidebar",
+                    "text" if selected else "text_secondary",
+                )
+            except tk.TclError:  # pragma: no cover - widget destroyed
+                pass
 
     def show_page(self, name: str) -> None:
         if name not in self.pages:
@@ -283,20 +402,13 @@ class EzSortApp:
 
         page = self.pages[name]
         page.lift()
+        self.current_page = name
+        self._paint_nav()
         try:
             page.on_show()
         except Exception:
             logger.exception("page on_show failed")
-        self.current_page = name
-        p = self.palette
-        for key, btn in self._nav_buttons.items():
-            selected = key == name
-            bg = p["selection"] if selected else p["sidebar"]
-            fg = p["text"] if selected else p["muted"]
-            btn["frame"].configure(bg=bg)
-            btn["label"].configure(bg=bg, fg=fg)
-            btn["icon"].configure(bg=bg)
-            icons.draw_icon(btn["icon"], key, p["text"] if selected else p["muted"])
+        self._refresh_status()
 
     @staticmethod
     def _page_class(name: str):
@@ -321,36 +433,57 @@ class EzSortApp:
     # ------------------------------------------------------------------
 
     def toast(self, message: str, kind: str = "info") -> None:
-        """Show a transient status message (info/success/warning/error)."""
-        colors = {
-            "info": self.palette["muted"],
-            "success": self.palette["success"],
-            "warning": self.palette["warning"],
-            "error": self.palette["danger"],
-        }
+        """Show a transient, non-blocking status message."""
+        if kind == "error":
+            kind = "danger"
+        if kind not in ("info", "success", "warning", "danger"):
+            kind = "info"
+        try:
+            self.toast_host.show(message, kind)
+        except Exception:  # pragma: no cover - toast host going away
+            logger.debug("toast failed", exc_info=True)
         self.status_var.set(message)
-        self.status_label.configure(fg=colors.get(kind, self.palette["muted"]))
-        if self._status_job:
-            try:
-                self.root.after_cancel(self._status_job)
-            except Exception:
-                pass
-        if kind in ("success", "info"):
-            self._status_job = self.root.after(
-                6000,
-                lambda: self.status_var.set(
-                    f"Folder: {short_path(str(self.folder), 70)}" if self.folder
-                    else "Ready"
-                ),
+
+    def set_folder(self, folder: Optional[Path]) -> None:
+        """Adopt *folder* app-wide and refresh every place that shows it."""
+        self.folder = folder
+        self._refresh_status()
+        if self.current_page:
+            page = self.pages.get(self.current_page)
+            if page is not None:
+                sync = getattr(page, "sync_folder", None)
+                if callable(sync):
+                    try:
+                        sync()
+                    except Exception:
+                        logger.debug("folder sync failed", exc_info=True)
+
+    def _refresh_status(self) -> None:
+        if self.folder:
+            text = f"Folder: {theme.short_path(str(self.folder), 78)}"
+        else:
+            text = "No folder selected - choose one in the Organizer."
+        if not self._running_labels:
+            self.status_var.set(text)
+        if self.watching and self.folder:
+            self.sidebar_status_var.set(
+                "Watching\n" + theme.short_path(str(self.folder), 30))
+            self.task_var.set("Watching for new files")
+        elif self._running_labels:
+            label = self._running_labels[-1]
+            self.sidebar_status_var.set(f"Busy: {label}")
+            self.task_var.set(f"{label.capitalize()}…")
+        else:
+            self.sidebar_status_var.set(
+                theme.short_path(str(self.folder), 30) if self.folder
+                else "No folder selected"
             )
+            self.task_var.set("")
 
     def set_busy(self, label: str) -> None:
         self._active_label = label
-        self.task_label.configure(
-            text=f"{label}…",
-            fg=self.palette["accent"],
-        )
-        self.sidebar_status.configure(text=f"Busy: {label}")
+        self.task_var.set(f"{label.capitalize()}…")
+        self.sidebar_status_var.set(f"Busy: {label}")
         if label == "watching":
             self.watching = True
 
@@ -364,23 +497,10 @@ class EzSortApp:
         if self.watching and label == "watching":
             self.watching = False
         if self._running_labels:
-            # Something else is still running - keep an honest indicator.
-            current = self._running_labels[-1]
-            self.task_label.configure(text=f"{current}…", fg=self.palette["accent"])
-            self.sidebar_status.configure(
-                text=(
-                    f"Watching:\n{short_path(str(self.folder), 34)}"
-                    if self.watching else f"Busy: {current}"
-                )
-            )
+            self._refresh_status()
             return
-        self.task_label.configure(text="", fg=self.palette["muted"])
-        self.sidebar_status.configure(
-            text=(
-                f"Watching:\n{short_path(str(self.folder), 34)}"
-                if self.watching else "Ready"
-            )
-        )
+        self.task_var.set("")
+        self._refresh_status()
 
     def _discard_label(self, label: str) -> None:
         """Forget one running-task entry (labels may repeat)."""
@@ -451,12 +571,12 @@ class EzSortApp:
         return self._cancel_tokens.get(label)
 
     def cancel_current(self) -> None:
-        """Cancel the cancellable task (organizing). Scans/undo finish fast
-        on their own; watch mode is stopped from the Organizer page."""
+        """Cancel the cancellable task (organizing)."""
         token = self._cancel_tokens.get("organizing")
         if token is not None:
             token.cancel()
-            self.toast("Cancelling - finishing the current file first…", "warning")
+            self.toast("Cancelling - finishing the current file first…",
+                       "warning")
         else:
             self.toast("Nothing cancellable is running.", "info")
 
@@ -473,12 +593,16 @@ class EzSortApp:
         self.activity.append(entry)
         if len(self.activity) > MAX_ACTIVITY:
             self.activity = self.activity[-MAX_ACTIVITY:]
+            save_activity(self.activity)
+        else:
+            append_activity(entry, MAX_ACTIVITY)
 
         page = self.pages.get("activity")
         if page is not None:
             page.append_entry(entry)
         page = self.pages.get("dashboard")
-        if page is not None and entry.get("type") in ("moved", "failed", "error", "undone"):
+        if page is not None and entry.get("type") in (
+                "moved", "failed", "error", "undone", "cancelled"):
             page.refresh_recent()
 
         kind = entry.get("type")
@@ -493,7 +617,7 @@ class EzSortApp:
     def reload_config(self) -> None:
         self.config = load_config()
 
-    def update_config(self, **values: Any) -> None:
+    def update_config(self, quiet: bool = False, **values: Any) -> None:
         """Persist configuration changes immediately."""
         self.config.update(values)
         try:
@@ -501,20 +625,16 @@ class EzSortApp:
         except OSError as e:
             self.toast(f"Could not save settings: {e}", "error")
             return
-        self.toast("Settings saved.", "success")
+        if not quiet:
+            self.toast("Saved.", "success")
 
     def apply_theme(self, name: str) -> None:
-        self.palette = get_palette(name)
-        apply_styles(self.root, self.palette)
-        # Rebuild chrome colours.
+        self.palette = theme.get_palette(name)
+        theme.apply_styles(self.root, self.palette)
         p = self.palette
         self.root.configure(bg=p["bg"])
         self.sidebar.configure(bg=p["sidebar"])
-        self.container.configure(bg=p["bg"])
-        self.statusbar.configure(bg=p["surface"])
-        self.status_label.configure(bg=p["surface"], fg=p["muted"])
-        self.task_label.configure(bg=p["surface"], fg=p["muted"])
-        self.sidebar_status.configure(bg=p["sidebar"], fg=p["muted"])
+        self.container.configure(style="TFrame")
         # The brand block and separators are plain tk widgets (ttk styles
         # never reach them), so recolor them explicitly.
         for widget, bg_role, fg_role in self._brand_widgets:
@@ -529,53 +649,116 @@ class EzSortApp:
                 sep_widget.configure(bg=p["border"])
             except tk.TclError:  # pragma: no cover - widget destroyed
                 pass
-        # Force every page to re-skin itself.
         for page in self.pages.values():
             try:
                 page.apply_theme()
             except Exception:
                 logger.exception("theme refresh failed for %s", page)
-        # Re-select nav to redraw icons.
-        current, self.current_page = self.current_page, ""
-        if current:
-            self.show_page(current)
+        self._theme_walk(self.root, p)
+        self._paint_nav()
+
+    def _theme_walk(self, widget, palette: dict) -> None:
+        """Re-skin raw-canvas components and dialogs after a theme switch."""
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            if getattr(child, "THEME_AWARE", False):
+                try:
+                    child.apply_theme(palette)
+                except Exception:
+                    logger.debug("theme-aware widget failed", exc_info=True)
+            self._theme_walk(child, palette)
 
     def open_config_location(self) -> None:
         path = get_config_path()
         try:
             get_config_dir().mkdir(parents=True, exist_ok=True)
-            if hasattr(self.root, "tk"):
-                import os
+            import os
 
-                if os.name == "nt":
-                    os.startfile(str(path.parent))  # noqa: S606
-                else:  # pragma: no cover - non-Windows convenience
-                    os.system(f'xdg-open "{path.parent}"')  # noqa: S605
+            if os.name == "nt":
+                os.startfile(str(path.parent))  # noqa: S606
+                self.toast("Opened the configuration folder.", "info")
+            else:  # pragma: no cover - non-Windows convenience
+                import subprocess
+
+                subprocess.Popen(["xdg-open", str(path.parent)])  # noqa: S603,S607
+                self.toast("Opened the configuration folder.", "info")
         except Exception as e:
-            messagebox.showinfo("Configuration", f"{path}\n\n({e})", parent=self.root)
+            self.toast(f"Could not open {path.parent}: {e}", "error")
 
     # ------------------------------------------------------------------
-    # Geometry / lifecycle
+    # Errors / lifecycle
     # ------------------------------------------------------------------
+
+    def _report_callback_exception(self, exc, value, tb) -> None:
+        """Show a friendly dialog instead of silently swallowing errors."""
+        logger.error("Unhandled UI error", exc_info=(exc, value, tb))
+        details = "".join(traceback.format_exception(exc, value, tb))
+        summary = (
+            "EzSort hit an unexpected error while handling that action. "
+            "Your files were not touched beyond what the page reports."
+        )
+        try:
+            ErrorDialog(self, summary, details).show()
+        except Exception:  # pragma: no cover - dialog itself failed
+            try:
+                messagebox.showerror("EzSort", f"{summary}\n\n{value}",
+                                     parent=self.root)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _work_area() -> tuple[int, int]:
+        """Return the usable desktop size (excludes the Windows taskbar)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA == 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(rect), 0):
+                return rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+        return 0, 0
 
     def _restore_geometry(self) -> None:
         geometry = self.config.get("window_geometry", "")
-        if isinstance(geometry, str) and geometry:
-            try:
-                self.root.geometry(geometry)
-            except tk.TclError:
-                pass
-        else:
-            self.root.geometry("1180x760")
+        width, height = (tokens.sc(v) for v in tokens.DEFAULT_WINDOW)
+        x = y = None
+        match = _GEOMETRY_RE.match(geometry) if isinstance(geometry, str) else None
+        if match:
+            width = max(tokens.sc(tokens.MIN_WINDOW[0]), int(match.group(1)))
+            height = max(tokens.sc(tokens.MIN_WINDOW[1]), int(match.group(2)))
+            x, y = int(match.group(3)), int(match.group(4))
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        work_w, work_h = self._work_area()
+        work_w = work_w or screen_w
+        work_h = work_h or screen_h
+        # Leave room for the title bar and a visible desktop margin; using the
+        # work area keeps the status bar above the taskbar.
+        width = min(width, max(tokens.sc(tokens.MIN_WINDOW[0]), work_w - 40))
+        height = min(height, max(tokens.sc(tokens.MIN_WINDOW[1]), work_h - 120))
+        if x is None or y is None:
+            x = max(0, (work_w - width) // 2)
+            y = max(0, (work_h - height) // 2 - 20)
+        x = max(0, min(x, work_w - width - 8))
+        y = max(0, min(y, work_h - height - 48))
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def on_close(self) -> None:
         if self._watch_stop is not None:
             self._watch_stop.set()
-        geometry = self.root.geometry()  # e.g. 1180x760+10+20
+        geometry = self.root.geometry()
         try:
             self.config = load_config()
             self.config["window_geometry"] = geometry
-            if self.folder:
+            self.config["last_page"] = self.current_page or "dashboard"
+            if self.folder and self.config.get("remember_last_folder", True):
                 self.config["last_folder"] = str(self.folder)
             save_config(self.config)
         except Exception:
@@ -591,4 +774,4 @@ class EzSortApp:
         return 0
 
 
-__all__ = ["EzSortApp"]
+__all__ = ["EzSortApp", "app_icon_path", "NAV_ITEMS"]

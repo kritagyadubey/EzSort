@@ -45,6 +45,11 @@ def get_history_path() -> Path:
     return get_config_dir() / "history.json"
 
 
+def get_activity_path() -> Path:
+    """Return the path to the persisted activity log."""
+    return get_config_dir() / "activity.json"
+
+
 def get_default_config() -> dict[str, Any]:
     """Return the default configuration dictionary."""
     return {
@@ -63,6 +68,7 @@ def get_default_config() -> dict[str, Any]:
         "last_folder": "",
         "remember_last_folder": True,
         "window_geometry": "",
+        "last_page": "dashboard",
     }
 
 

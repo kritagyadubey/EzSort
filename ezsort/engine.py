@@ -21,6 +21,7 @@ from ezsort.config import (
 from ezsort.constants import PARTIAL_DOWNLOAD_EXTENSIONS
 from ezsort.duplicate import find_duplicates
 from ezsort.history import (
+    UndoReport,
     clear_history,
     get_batch,
     get_history,
@@ -28,7 +29,9 @@ from ezsort.history import (
     record_operations,
     remove_batch,
     undo_batch,
+    undo_batch_detailed,
     undo_last,
+    undo_last_detailed,
 )
 from ezsort.models import FileItem, Operation, OperationResult
 from ezsort.organizer import execute_operations
@@ -65,6 +68,8 @@ class ExecutionSummary:
     dry_run: bool = False
     cancelled: bool = False
     elapsed: float = 0.0
+    #: How many moves this run was asked to perform (after duplicate skips).
+    planned: int = 0
     #: Planned moves that were deliberately not run (duplicate_strategy=skip).
     skipped_duplicates: list[Operation] = field(default_factory=list)
 
@@ -190,6 +195,7 @@ def run_plan(
                 runnable.append(op)
         planned = runnable
 
+    summary.planned = len(planned)
     start = _time.perf_counter()
     results = execute_operations(
         planned,
@@ -209,7 +215,10 @@ def run_plan(
         try:
             folder = preview.folder if isinstance(preview, PreviewResult) else None
             summary.batch_id = record_operations(
-                results, folder=str(folder) if folder else None
+                results,
+                folder=str(folder) if folder else None,
+                cancelled=summary.cancelled,
+                planned_total=summary.planned,
             )
         except Exception:  # pragma: no cover - never lose the run itself
             logger.warning("Could not record history", exc_info=True)
@@ -261,6 +270,16 @@ def undo_last_batch() -> tuple[bool, str]:
 
 def undo_specific_batch(batch_id: str) -> tuple[bool, str]:
     return undo_batch(batch_id)
+
+
+def undo_last_report() -> UndoReport:
+    """Undo the newest batch and return the structured report (GUI)."""
+    return undo_last_detailed()
+
+
+def undo_specific_report(batch_id: str) -> UndoReport:
+    """Undo a batch and return the structured report (GUI)."""
+    return undo_batch_detailed(batch_id)
 
 
 def wipe_history() -> None:

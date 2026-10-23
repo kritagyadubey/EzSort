@@ -1,10 +1,22 @@
-"""History tracking and undo support."""
+"""History tracking and undo support.
+
+The on-disk format stays backwards compatible with v0.3.0. New fields are
+purely additive:
+
+* ``status`` on a batch: ``completed``, ``cancelled``, ``partial`` or
+  ``undone`` (older batches simply lack the key and mean ``completed``).
+* ``cancelled`` / ``total_planned`` describe an interrupted run.
+* A fully undone batch is kept as a tombstone (``undone: true``) instead of
+  vanishing, so the History page can show what happened. Tombstones carry no
+  operations and cannot be undone twice.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import shutil
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +71,8 @@ def _next_batch_id(history: list[dict]) -> str:
 def record_operations(
     results: list[OperationResult],
     folder: str | None = None,
+    cancelled: bool = False,
+    planned_total: int | None = None,
 ) -> str:
     """Record operation results to history.
 
@@ -81,7 +95,11 @@ def record_operations(
         "operations": [],
         "total_moved": len(successful),
         "total_failed": len(failed),
+        "status": "cancelled" if cancelled else "completed",
+        "cancelled": bool(cancelled),
     }
+    if planned_total is not None:
+        batch_entry["total_planned"] = int(planned_total)
     if folder:
         batch_entry["folder"] = str(folder)
 
@@ -103,10 +121,11 @@ def record_operations(
     _save_history(history)
 
     logger.info(
-        "Recorded batch %s: %d moved, %d failed",
+        "Recorded batch %s: %d moved, %d failed%s",
         batch_id,
         len(successful),
         len(failed),
+        " (cancelled)" if cancelled else "",
     )
     return batch_id
 
@@ -125,40 +144,72 @@ def get_batch(batch_id: str) -> dict | None:
     return None
 
 
+@dataclass
+class UndoReport:
+    """Structured outcome of an undo, for honest UI reporting."""
+
+    success: bool
+    message: str
+    restored: int = 0
+    missing: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    batch_id: str = ""
+
+    @property
+    def had_problems(self) -> bool:
+        return bool(self.conflicts or self.errors)
+
+
 def undo_last() -> tuple[bool, str]:
     """Undo the most recent batch of operations.
 
     Returns:
         Tuple of (success, message).
     """
+    report = undo_last_detailed()
+    return report.success, report.message
+
+
+def undo_batch(batch_id: str) -> tuple[bool, str]:
+    """Undo a specific batch by ID."""
+    report = undo_batch_detailed(batch_id)
+    return report.success, report.message
+
+
+def undo_last_detailed() -> UndoReport:
+    """Undo the newest batch that still has operations."""
     history = _load_history()
     if not history:
-        return False, "No operations to undo."
+        return UndoReport(False, "No operations to undo.")
 
     # Find the newest batch that still contains operations to reverse.
     index = len(history) - 1
     while index >= 0 and not history[index].get("operations"):
         index -= 1
     if index < 0:
-        history = [b for b in history if b.get("operations")]
-        _save_history(history)
-        return False, "No operations to undo."
-
+        return UndoReport(False, "No operations to undo.")
     return _undo_batch_at(history, index)
 
 
-def undo_batch(batch_id: str) -> tuple[bool, str]:
-    """Undo a specific batch by ID."""
+def undo_batch_detailed(batch_id: str) -> UndoReport:
+    """Undo a specific batch, returning a structured report."""
     history = _load_history()
     for i, batch in enumerate(history):
         if str(batch.get("batch_id")) == str(batch_id):
+            if batch.get("undone"):
+                return UndoReport(
+                    False, f"Batch {batch_id} was already undone.",
+                    batch_id=str(batch_id))
             if not batch.get("operations"):
-                return False, f"Batch {batch_id} has no operations to undo."
+                return UndoReport(
+                    False, f"Batch {batch_id} has no operations to undo.",
+                    batch_id=str(batch_id))
             return _undo_batch_at(history, i)
-    return False, f"Batch {batch_id} not found in history."
+    return UndoReport(False, f"Batch {batch_id} not found in history.")
 
 
-def _undo_batch_at(history: list[dict], index: int) -> tuple[bool, str]:
+def _undo_batch_at(history: list[dict], index: int) -> UndoReport:
     """Undo the batch at *index* inside *history*, then persist the result.
 
     Safety rules:
@@ -169,6 +220,7 @@ def _undo_batch_at(history: list[dict], index: int) -> tuple[bool, str]:
         reported and dropped, because retrying can never succeed.
     """
     batch = history[index]
+    batch_id = str(batch.get("batch_id", ""))
     operations = batch.get("operations", [])
 
     restored = 0
@@ -215,10 +267,21 @@ def _undo_batch_at(history: list[dict], index: int) -> tuple[bool, str]:
     if remaining:
         batch = dict(batch)
         batch["operations"] = list(reversed(remaining))
-        batch["total_moved"] = len(remaining)
+        batch["total_moved"] = sum(
+            1 for op in batch["operations"] if op.get("status") != "failed")
+        batch["status"] = "partial"
+        batch["undone"] = False
         history[index] = batch
     else:
-        history.pop(index)
+        # Tombstone: keep the record so History can explain what happened,
+        # but mark it as spent so it can never be undone twice.
+        batch = dict(batch)
+        batch["operations"] = []
+        batch["undone"] = True
+        batch["undone_at"] = datetime.now(timezone.utc).isoformat()
+        batch["status"] = "undone"
+        batch["restored"] = restored
+        history[index] = batch
     _save_history(history)
 
     problems = conflicts + other_errors + [
@@ -238,7 +301,15 @@ def _undo_batch_at(history: list[dict], index: int) -> tuple[bool, str]:
 
     # Success means everything that could be restored was restored.
     success = not conflicts and not other_errors
-    return success, msg
+    return UndoReport(
+        success=success,
+        message=msg,
+        restored=restored,
+        missing=missing,
+        conflicts=conflicts,
+        errors=other_errors,
+        batch_id=batch_id,
+    )
 
 
 def clear_history() -> None:
@@ -248,21 +319,30 @@ def clear_history() -> None:
 
 
 def history_stats() -> dict[str, Any]:
-    """Aggregate statistics derived from history."""
+    """Aggregate statistics derived from history.
+
+    Undone batches stay on disk as tombstones but no longer count as
+    organized files.
+    """
     history = _load_history()
     total_moved = 0
     total_failed = 0
+    undone_batches = 0
     categories: dict[str, int] = {}
     for batch in history:
+        if batch.get("undone"):
+            undone_batches += 1
+            continue
         total_moved += int(batch.get("total_moved", 0) or 0)
         total_failed += int(batch.get("total_failed", 0) or 0)
         for op in batch.get("operations", []):
-            if op.get("status") == "failed":
+            if op.get("status") in ("failed", "undone"):
                 continue
             cat = str(op.get("category", "Others")).split("/")[0]
             categories[cat] = categories.get(cat, 0) + 1
     return {
-        "batches": len(history),
+        "batches": len(history) - undone_batches,
+        "undone_batches": undone_batches,
         "total_moved": total_moved,
         "total_failed": total_failed,
         "categories": categories,

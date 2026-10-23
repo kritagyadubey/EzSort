@@ -46,11 +46,24 @@ jobs:
           ./dist/ezsort-cli/ezsort.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Verify CLI executable end to end
+        run: python scripts/verify_cli_exe.py dist/ezsort-cli/ezsort.exe
+
+      - name: Verify GUI executable end to end
+        run: python scripts/verify_gui_exe.py dist/EzSort/EzSort.exe
+
       - name: Stage release folders
         shell: pwsh
         run: |
           Compress-Archive -Path dist/ezsort-cli/* -DestinationPath ezsort-cli-windows.zip
           Compress-Archive -Path dist/EzSort/* -DestinationPath EzSort-gui-windows.zip
+          $files = @("EzSort-gui-windows.zip", "ezsort-cli-windows.zip")
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $file"
+          }
+          $lines | Set-Content -Path SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -59,13 +72,16 @@ jobs:
           path: |
             ezsort-cli-windows.zip
             EzSort-gui-windows.zip
+            SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: "EzSort v0.4.0: a redesigned desktop experience"
+          body_path: docs/release-notes/v0.4.0.md
           files: |
             ezsort-cli-windows.zip
             EzSort-gui-windows.zip
-          generate_release_notes: true
+            SHA256SUMS.txt

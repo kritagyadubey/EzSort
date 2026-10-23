@@ -56,7 +56,7 @@ No files deleted. No files overwritten. Just organized.
 
 ---
 
-## Desktop App (v0.3.0)
+## Desktop App (v0.4.0)
 
 EzSort ships with a premium desktop app — same engine, same safety
 guarantees, zero extra runtime dependencies (it uses the Tkinter that
@@ -69,6 +69,8 @@ theme; both are contrast-checked to WCAG AA.
 
 ![Light theme](docs/screenshots/dashboard-light.png)
 
+![Categories and rules](docs/screenshots/categories.png)
+
 ![Settings](docs/screenshots/settings.png)
 
 ![History](docs/screenshots/history.png)
@@ -78,13 +80,15 @@ theme; both are contrast-checked to WCAG AA.
 **Features**
 
 - **Dashboard** — pick a folder, see live stats, jump straight into a preview
-- **Organizer** — preview every planned move in a table, then execute with one click; cancellable mid-sort
-- **Categories** — browse built-in categories and add/edit/delete custom rules
-- **History** — list past sorts, inspect the files in each, and undo any batch (conflict-safe)
-- **Activity** — live event log of everything EzSort did, this session and last
+- **Organizer** — preview every planned move in a table, filter or search the plan, then execute with one click; cancellable mid-sort
+- **Categories** — browse built-in categories and add/edit/delete custom rules, with validation before saving
+- **History** — search past sorts, inspect the files in each, and undo any batch (conflict-safe)
+- **Activity** — live, persisted event log of everything EzSort did, this session and last
 - **Settings** — dark/light theme, duplicate strategy, watch interval, and more; changes save instantly
 
-Every button does real work — previews are the same plan the CLI would execute.
+Every button does real work — previews are the same plan the CLI would
+execute, and every number comes from the engine, config, history, or
+activity log.
 
 **Keyboard shortcuts**
 
@@ -92,7 +96,11 @@ Every button does real work — previews are the same plan the CLI would execute
 |-----|--------|
 | `Ctrl+1` … `Ctrl+6` | Jump to a page |
 | `F5` | Refresh the current page |
+| `Ctrl+F` | Focus the current page's search |
+| `Ctrl+O` | Choose a folder |
+| `F1` | Show the shortcut sheet |
 | `Enter` | Run a preview from the folder box |
+| `Esc` | Close an overlay / leave search |
 
 **Launch it**
 
@@ -175,8 +183,8 @@ Keeps a folder sorted automatically. New files get moved as they appear. Press `
 ezsort gui
 ```
 
-Launches the EzSort desktop app with a premium dark theme. Same engine,
-same preview-first safety.
+Launches the EzSort desktop app in your saved theme (dark by default, light
+available). Same engine, same preview-first safety.
 
 ### `undo` -- Take it back
 

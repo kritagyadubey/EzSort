@@ -4,6 +4,77 @@ All notable changes to EzSort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-10-23
+
+A ground-up redesign of the desktop app. The sorting engine, CLI, and
+on-disk formats keep working exactly as before; the presentation layer,
+responsiveness, and performance were rebuilt.
+
+### Added
+
+- **New design system.** One token scale for spacing, type, radii, and
+  colors, with independently tuned dark (warm slate) and light (warm
+  paper) palettes. Every text/background pair used by the UI is checked
+  against WCAG AA in the test suite.
+- **Rebuilt shell and all six pages.** Dashboard, Organizer, Categories &
+  Rules, History & Undo, Activity, and Settings share a consistent
+  sidebar, page header, card, table, badge, banner, dialog, toast, and
+  empty-state language.
+- **Responsive layout.** Tables re-proportion their columns instead of
+  forcing the page wider; scrollbars hide themselves when content fits;
+  the Organizer and Categories toolbars switch to compact labels at narrow
+  widths. All pages were verified at the 1281x851 physical minimum.
+- **Search and filtering.** Organizer rows can be filtered by moves,
+  renames, or skips and searched by file/category/destination; History and
+  Activity have live search; Categories filters by name; Activity also has
+  kind chips (moved/failed/skipped/errors/info).
+- **Persistent activity log.** `activity.json` keeps the last 500 entries
+  across sessions, tolerates v0.3.0 entries without a `type`, and moves an
+  unreadable file aside instead of deleting it.
+- **Keyboard shortcuts and help.** `Ctrl+1`…`Ctrl+6` navigate, `F5`
+  refreshes, `Ctrl+F` focuses search, `Ctrl+O` chooses a folder, `F1`
+  shows the shortcut sheet, and `Esc` closes overlays/cancels focus.
+- **Release integrity.** Windows releases attach the GUI zip, CLI zip, and
+  a generated `SHA256SUMS.txt`, with release notes from the repository.
+
+### Changed
+
+- **Truthful status everywhere.** Dashboard stats, folder badges, table
+  counts, progress bars, and Activity chips are derived from the live
+  engine/config/history state; there are no placeholder numbers.
+- **History keeps an audit trail.** Batches record `status`, `cancelled`,
+  and `total_planned`; a fully undone batch remains as a tombstone that is
+  excluded from statistics and cannot be undone twice. Structured
+  `UndoReport` values let the UI distinguish restored, missing, and
+  conflicting files.
+- **Undo is conflict-safe by construction.** Existing files at the
+  original location are never overwritten; the remaining work stays in
+  history for a later retry.
+- **Cancellation is per task.** Scan, sort, and watch runs own separate
+  tokens, so cancelling one never stops another.
+- **Faster large folders.** Planning is now O(n) (target resolved once,
+  lexical source mapping), the scanner reuses `DirEntry` metadata, and
+  table inserts avoid a quadratic empty-state check. A 10k-file preview
+  dropped from roughly 100 seconds to under 10 seconds locally.
+- **Packaging and versioning.** Version 0.4.0 is the single source in
+  `ezsort/__init__.py`, mirrored by `pyproject.toml` and tested for
+  consistency; the Windows build verifies both executables before release.
+
+### Fixed
+
+- Tables no longer force the page wider than the window, and long values
+  are middle-ellipsized with full-text tooltips.
+- Scrollable areas now update their scroll region even when a page adds
+  its own `<Configure>` handler; tall Dashboard activity is reachable
+  instead of being silently clipped.
+- Programmatic search values no longer collide with the placeholder state.
+- Inline banner text uses the palette role's color instead of a role name.
+- Toast and tooltip overlays are excluded from documentation captures.
+- The sidebar, separators, and brand block recolor correctly on every
+  theme switch.
+- The minimum-size window keeps the status bar above the taskbar and no
+  longer clips page chrome.
+
 ## [0.3.0] - 2026-10-15
 
 A stability-and-polish release. No new commands; the focus was making
